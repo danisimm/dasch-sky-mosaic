@@ -9,12 +9,5 @@ __pycache__/
 build/
 dist/
 
-# Downloaded plate data - can be re-fetched
-data/cache/
-
-# Large binary output files
-data/output/*.fits
-data/output/*.fits.fz
-data/output/*.fits.gz
-
-# JSON manifests are tracked (small, useful for reproducibility)
+# Ignore all local data artifacts
+data/

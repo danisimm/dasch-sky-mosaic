@@ -1,0 +1,26 @@
+{
+  "region": {
+    "ra_deg": 10.6847083,
+    "dec_deg": 41.26875,
+    "width_deg": 0,
+    "height_deg": 0
+  },
+  "as_of_date": null,
+  "earliest_date": null,
+  "projection": "TAN",
+  "pixel_scale_arcsec": 60.0,
+  "binning": 16,
+  "query_step_deg": 1.0,
+  "subtract_background": true,
+  "allow_multi_solution_plates": true,
+  "plates": [
+    {
+      "plate_id": "dnb06700",
+      "obs_date": "1989-11-30T03:09:00.000",
+      "obs_date_jd": 2447860.63125,
+      "n_wcs_solutions": 1,
+      "selected_at_points": 1,
+      "local_mosaic_path": "data\\cache\\dasch_session\\mosaics\\dnb06700_16.fits"
+    }
+  ]
+}

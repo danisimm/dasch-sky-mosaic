@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dasch-sky-mosaic"
+version = "0.1.0"
+description = "Build time-filtered, WCS-preserving sky mosaics from DASCH value-added plate mosaics."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "astropy>=6.1",
+  "daschlab>=0.1.dev0",
+  "numpy>=2.0",
+  "python-dotenv>=1.0",
+  "reproject>=0.15",
+  "requests>=2.32",
+]
+
+[project.scripts]
+dasch-sky-mosaic = "dasch_sky_mosaic.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -5,423 +5,36 @@ import logging
 import math
 import os
 import shutil
-from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from astropy.io import fits
-from astropy.time import Time
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
-from daschlab import open_session
 from reproject import reproject_interp
-from scipy.ndimage import binary_erosion
 
-from dasch_sky_mosaic.api import StarglassClient, parse_obs_date_jd
+from dasch_sky_mosaic.background import (
+    _estimate_overlap_template_refinement,
+    _evaluate_residual_surface,
+    _fit_plate_background,
+    _fit_overlap_residual_surface,
+    _plate_interior_mask,
+    _solve_global_bg_offsets,
+)
+from dasch_sky_mosaic.fetch import (
+    BuildConfig,
+    CandidatePlate,
+    Region,
+    _should_log_progress,
+    discover_candidate_plates,
+    download_mosaic_paths,
+    jd_to_iso,
+)
 
 LOG = logging.getLogger(__name__)
-
-_EDGE_TRIM_FRACTION = 0.05
-_MAD_TO_STDDEV = 1.4826
-
-
-def _normalize_ra_deg(value: float) -> float:
-    return value % 360.0
-
-
-def jd_to_iso(jd: float) -> str:
-    return Time(jd, format="jd", scale="utc").isot # type: ignore
-
-
-def parse_cli_date_jd(value: str | None) -> float | None:
-    """Parse a user-supplied date string into a Julian Date float.
-
-    Accepts ISO format (e.g. '1950-12-31') or a raw Julian Date number.
-    Raises ValueError for unrecognised input.
-    """
-    if not value:
-        return None
-    jd = parse_obs_date_jd(value)
-    if jd is None:
-        raise ValueError(f"Cannot parse date {value!r}. Use ISO format, e.g. 1950-12-31.")
-    return jd
-
-
-@dataclass(frozen=True)
-class Region:
-    ra_deg: float
-    dec_deg: float
-    width_deg: float
-    height_deg: float
-
-
-@dataclass(frozen=True)
-class CandidatePlate:
-    plate_id: str
-    obs_date_jd: float
-    n_wcs_solutions: int
-    selected_at_points: int
-
-
-@dataclass(frozen=True)
-class BuildConfig:
-    region: Region
-    as_of_jd: float | None
-    earliest_jd: float | None
-    session_root: Path
-    output_fits: Path
-    epoch_fits: Path | None
-    manifest_json: Path
-    pixel_scale_arcsec: float | None
-    projection: str
-    binning: int
-    query_step_deg: float
-    api_base: str
-    api_key: str | None
-    subtract_background: bool
-    allow_multi_solution_plates: bool
-    delete_base_mosaics: bool
-    overwrite: bool
-    max_plates: int | None
-
-
-def _grid_axis(half_width_deg: float, spacing_deg: float) -> list[float]:
-    if half_width_deg == 0:
-        return [0.0]
-
-    n_steps = max(1, math.ceil((2.0 * half_width_deg) / spacing_deg))
-    axis = np.linspace(-half_width_deg, half_width_deg, num=n_steps + 1)
-    return [float(v) for v in axis]
-
-
-def _should_log_progress(index: int, total: int) -> bool:
-    """Log each step for small totals; ~10 checkpoints for larger runs."""
-    if total <= 20:
-        return True
-    stride = max(1, total // 10)
-    return index == 1 or index == total or (index % stride == 0)
-
-
-def _plate_interior_mask(image: np.ndarray, binning: int) -> np.ndarray:
-    """Build support mask using geometric trimming of raw mosaic edges.
-
-    We keep all finite data values and remove 5% from each edge of the raw
-    plate mosaic (as requested) to avoid boundary artefacts.
-    """
-    support = np.isfinite(image)
-
-    ny, nx = image.shape
-    trim_y = max(1, int(round(_EDGE_TRIM_FRACTION * ny)))
-    trim_x = max(1, int(round(_EDGE_TRIM_FRACTION * nx)))
-    support[:trim_y, :] = False
-    support[-trim_y:, :] = False
-    support[:, :trim_x] = False
-    support[:, -trim_x:] = False
-
-    # A light erosion avoids one-pixel edge interpolation artefacts.
-    erosion_iters = max(1, int(round(6.0 / max(1, binning))))
-    return binary_erosion(support, iterations=erosion_iters)
-
-
-def _robust_clip(arr: np.ndarray, lo_pct: float = 5.0, hi_pct: float = 95.0) -> np.ndarray:
-    """Return a boolean mask selecting values within [lo_pct, hi_pct] percentile range."""
-    lo, hi = np.nanpercentile(arr, [lo_pct, hi_pct])
-    return (arr >= lo) & (arr <= hi)
-
-
-def _fit_plate_background(image: np.ndarray, degree: int = 2) -> np.ndarray:
-    """Fit and return a smooth 2D polynomial background model for a plate.
-
-    Samples the plate on a coarse grid using the 20th-percentile of each block
-    so that point sources (stars) are excluded and only the diffuse background
-    is modelled.  The resulting surface captures both the large-scale sky
-    background and radially symmetric vignetting (bright centre -> dark corners
-    in photographic plates), which is a degree-2 radial polynomial.
-
-    This is analogous to the per-image background modelling step in the IPAC
-    Montage pipeline (mBackground), which must precede global offset matching so
-    that spatially varying illumination does not bias the pairwise statistics.
-
-    Returns an array of the same shape as `image`, dtype float32.
-    """
-    ny, nx = image.shape
-    stride = max(4, min(ny, nx) // 40)
-    half = stride // 2
-
-    sample_y: list[float] = []
-    sample_x: list[float] = []
-    sample_v: list[float] = []
-
-    for y in range(half, ny, stride):
-        for x in range(half, nx, stride):
-            block = image[max(0, y - half):min(ny, y + half),
-                          max(0, x - half):min(nx, x + half)].ravel()
-            finite = block[np.isfinite(block)]
-            if len(finite) < 4:
-                continue
-            # Low percentile -> background, not stellar peaks.
-            sample_y.append(y / ny - 0.5)   # centred on 0 for numerical stability
-            sample_x.append(x / nx - 0.5)
-            sample_v.append(float(np.percentile(finite, 20)))
-
-    n_terms = (degree + 1) * (degree + 2) // 2
-    if len(sample_v) < n_terms + 1:
-        return np.full(image.shape, float(np.nanmedian(image)), dtype=np.float32)
-
-    sy = np.array(sample_y)
-    sx = np.array(sample_x)
-    sv = np.array(sample_v, dtype=np.float64)
-
-    # Sigma-clip blocks that are dominated by emission (bright galaxies, etc.).
-    med = np.median(sv)
-    mad = np.median(np.abs(sv - med)) * _MAD_TO_STDDEV + 1e-6
-    keep = np.abs(sv - med) <= 5.0 * mad
-    if keep.sum() < n_terms + 1:
-        keep = np.ones(len(sv), dtype=bool)
-    sy, sx, sv = sy[keep], sx[keep], sv[keep]
-
-    def _design(y_arr: np.ndarray, x_arr: np.ndarray) -> np.ndarray:
-        cols = []
-        for i in range(degree + 1):
-            for j in range(degree + 1 - i):
-                cols.append(y_arr ** i * x_arr ** j)
-        return np.column_stack(cols)
-
-    try:
-        coeffs, _, _, _ = np.linalg.lstsq(_design(sy, sx), sv, rcond=None)
-    except Exception:
-        return np.full(image.shape, float(np.nanmedian(image)), dtype=np.float32)
-
-    Y, X = np.mgrid[0:ny, 0:nx]
-    Yn = (Y / ny - 0.5).ravel().astype(np.float64)
-    Xn = (X / nx - 0.5).ravel().astype(np.float64)
-    bg = (_design(Yn, Xn) @ coeffs).reshape(ny, nx).astype(np.float32)
-    return bg
-
-
-def _solve_global_bg_offsets(
-    reprojected_plates: list[np.ndarray],
-    good_masks: list[np.ndarray],
-    plate_names: list[str],
-) -> list[float]:
-    """Solve for per-plate additive background corrections to eliminate seam lines.
-
-    Implements the global background-matching algorithm used by IPAC Montage
-    (Berriman et al. 2003) and conceptually related to SDSS ubercalibration
-    (Padmanabhan et al. 2008).
-
-    Rather than matching each plate sequentially against the accumulated mosaic
-    (which drifts with plate order), this collects all pairwise overlap
-    measurements simultaneously and solves the overdetermined linear system
-
-        a_i - a_j = d_ij   for all overlapping pairs (i, j)
-
-    by least squares, where d_ij is the robust median of (plate_i - plate_j)
-    in the shared footprint.  The most-recently observed plate (last in sorted
-    order) is anchored at a = 0, so its background level becomes the
-    photometric reference for the whole mosaic.
-
-    Returns a list of additive offsets; add offset[i] to plate i before
-    compositing.
-    """
-    N = len(reprojected_plates)
-    if N <= 1:
-        return [0.0] * N
-
-    constraint_rows: list[np.ndarray] = []
-    constraint_rhs: list[float] = []
-
-    for i in range(N):
-        for j in range(i + 1, N):
-            overlap = good_masks[i] & good_masks[j]
-            n_overlap = int(np.count_nonzero(overlap))
-            if n_overlap < 300:
-                continue
-
-            diff = (
-                reprojected_plates[i][overlap].astype(np.float64)
-                - reprojected_plates[j][overlap].astype(np.float64)
-            )
-            core = diff[_robust_clip(diff)]
-            if len(core) < 50:
-                continue
-
-            d_ij = float(np.median(core))
-            row = np.zeros(N, dtype=np.float64)
-            row[i] = 1.0
-            row[j] = -1.0
-            constraint_rows.append(row)
-            constraint_rhs.append(d_ij)
-            LOG.info(
-                "Overlap constraint (%s, %s): n_pixels=%d  delta=%.2f",
-                plate_names[i],
-                plate_names[j],
-                n_overlap,
-                d_ij,
-            )
-
-    if not constraint_rows:
-        LOG.warning(
-            "No overlapping plate pairs with sufficient coverage; "
-            "global background matching has no effect."
-        )
-        return [0.0] * N
-
-    # Anchor the most-recently observed plate (last in date-sorted list).
-    anchor = np.zeros(N, dtype=np.float64)
-    anchor[N - 1] = 1.0
-    constraint_rows.append(anchor)
-    constraint_rhs.append(0.0)
-
-    A = np.array(constraint_rows, dtype=np.float64)
-    b = np.array(constraint_rhs, dtype=np.float64)
-    offsets_raw, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    offsets = [float(x) for x in offsets_raw]
-    LOG.info(
-        "Global background offsets (reference=%s): %s",
-        plate_names[N - 1],
-        "  ".join(f"{plate_names[i]}={offsets[i]:+.2f}" for i in range(N)),
-    )
-    return offsets
-
-
-def _estimate_overlap_template_refinement(
-    reference: np.ndarray,
-    candidate: np.ndarray,
-    template: np.ndarray,
-    overlap: np.ndarray,
-) -> tuple[float, float, bool]:
-    """Estimate seam-focused correction: candidate += gain*template + offset.
-
-    This uses only overlap pixels, so the adjustment is driven by agreement
-    where plates actually meet (not by interior brightness structure).
-    """
-    n_overlap = int(np.count_nonzero(overlap))
-    if n_overlap < 500:
-        return 0.0, 0.0, False
-
-    y = (reference[overlap] - candidate[overlap]).astype(np.float64)
-    t = template[overlap].astype(np.float64)
-
-    keep = _robust_clip(y) & _robust_clip(t)
-    if int(np.count_nonzero(keep)) < 300:
-        return 0.0, 0.0, False
-    y_fit = y[keep]
-    t_fit = t[keep]
-
-    if np.nanstd(t_fit) < 1e-3:
-        return 0.0, float(np.nanmedian(y_fit)), True
-
-    X = np.column_stack((t_fit, np.ones_like(t_fit)))
-    try:
-        gain, offset = np.linalg.lstsq(X, y_fit, rcond=None)[0]
-    except Exception:
-        return 0.0, 0.0, False
-
-    # Constrain to plausible corrections; reject unstable fits.
-    if not np.isfinite(gain) or abs(gain) > 0.6:
-        return 0.0, 0.0, False
-    if not np.isfinite(offset) or abs(offset) > 1500:
-        return 0.0, 0.0, False
-    return float(gain), float(offset), True
-
-
-def iter_query_points(region: Region, query_step_deg: float) -> list[tuple[float, float]]:
-    dec_offsets = _grid_axis(region.height_deg / 2.0, query_step_deg)
-    points: list[tuple[float, float]] = []
-
-    for dec_offset in dec_offsets:
-        dec_deg = max(-90.0, min(90.0, region.dec_deg + dec_offset))
-        cos_dec = max(math.cos(math.radians(dec_deg)), 0.05)
-        ra_spacing = query_step_deg / cos_dec
-        ra_offsets = _grid_axis(region.width_deg / 2.0, ra_spacing)
-
-        for ra_offset in ra_offsets:
-            points.append((_normalize_ra_deg(region.ra_deg + ra_offset), dec_deg))
-
-    unique: dict[tuple[int, int], tuple[float, float]] = {}
-    for ra_deg, dec_deg in points:
-        unique[(round(ra_deg * 1000), round(dec_deg * 1000))] = (ra_deg, dec_deg)
-    return list(unique.values())
-
-
-def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
-    """Select plates using only queryexps data — no per-plate get_plate() calls.
-
-    For each grid point the single most recently observed plate with
-    wcssource=='imwcs' that satisfies the date bounds is chosen as the
-    winner for that point.  Only the union of those per-point winners is
-    ever downloaded.
-    """
-    client = StarglassClient(api_base=config.api_base, api_key=config.api_key)
-    query_points = iter_query_points(config.region, config.query_step_deg)
-    LOG.info("Querying %d sky positions via %s", len(query_points), client.base_url)
-
-    plate_exposures: dict[str, list[tuple[float | None, int | None]]] = {}
-    point_winner: dict[tuple[int, int], str] = {}
-
-    for idx, (ra_deg, dec_deg) in enumerate(query_points, start=1):
-        if _should_log_progress(idx, len(query_points)):
-            LOG.info(
-                "Discovery progress: %d/%d query points (%.0f%%)",
-                idx,
-                len(query_points),
-                (100.0 * idx) / max(1, len(query_points)),
-            )
-        hits = client.query_exposures(ra_deg=ra_deg, dec_deg=dec_deg)
-        eligible = [h for h in hits if h.has_imaging]
-        if config.as_of_jd is not None:
-            eligible = [h for h in eligible if h.obs_date_jd is not None and h.obs_date_jd <= config.as_of_jd]
-        if config.earliest_jd is not None:
-            eligible = [h for h in eligible if h.obs_date_jd is not None and h.obs_date_jd >= config.earliest_jd]
-        for h in eligible:
-            plate_exposures.setdefault(h.plate_id, []).append((h.obs_date_jd, h.solnum))
-        best = max(
-            eligible,
-            key=lambda h: h.obs_date_jd if h.obs_date_jd is not None else -1.0,
-            default=None,
-        )
-        if best is not None:
-            point_winner[(round(ra_deg * 1000), round(dec_deg * 1000))] = best.plate_id
-
-    selection_counts = Counter(point_winner.values())
-    LOG.info(
-        "Discovered %d candidate plates; %d selected as most-recent at >= 1 query point",
-        len(plate_exposures),
-        len(selection_counts),
-    )
-
-    candidates: list[CandidatePlate] = []
-    for plate_id, point_count in selection_counts.items():
-        exposures = plate_exposures.get(plate_id, [])
-        solnums = {s for _, s in exposures if s is not None}
-        n_wcs = len(solnums)
-        if not config.allow_multi_solution_plates and n_wcs > 1:
-            continue
-        valid_jds = [jd for jd, _ in exposures if jd is not None]
-        if not valid_jds:
-            continue
-        candidates.append(CandidatePlate(
-            plate_id=plate_id,
-            obs_date_jd=max(valid_jds),
-            n_wcs_solutions=n_wcs,
-            selected_at_points=point_count,
-        ))
-
-    candidates.sort(key=lambda c: c.obs_date_jd)
-
-    if config.max_plates is not None and len(candidates) > config.max_plates:
-        candidates = sorted(candidates, key=lambda c: -c.obs_date_jd)[: config.max_plates]
-        candidates.sort(key=lambda c: c.obs_date_jd)
-
-    LOG.info(
-        "Final plate count: %d (allow_multi_solution_plates=%s)",
-        len(candidates),
-        config.allow_multi_solution_plates,
-    )
-    return candidates
+_RESIDUAL_SURFACE_DEGREE = 1
 
 
 def _build_output_wcs(region: Region, projection: str, pixel_scale_arcsec: float) -> tuple[WCS, tuple[int, int]]:
@@ -455,47 +68,52 @@ def _prepare_output_path(path: Path, overwrite: bool) -> None:
         raise FileExistsError(f"refusing to overwrite existing file: {path}")
 
 
-def _download_mosaic_paths(session_root: Path, plate_ids: list[str], binning: int) -> dict[str, Path]:
-    session_root.mkdir(parents=True, exist_ok=True)
-    session = open_session(str(session_root))
-    paths: dict[str, Path] = {}
-
-    for idx, plate_id in enumerate(plate_ids, start=1):
-        if _should_log_progress(idx, len(plate_ids)):
-            LOG.info(
-                "Download progress: %d/%d plate mosaics (%.0f%%)",
-                idx,
-                len(plate_ids),
-                (100.0 * idx) / max(1, len(plate_ids)),
-            )
-        LOG.info("Fetching DASCH mosaic for %s", plate_id)
-        relpath = session.mosaic(plate_id, binning)
-        if relpath is None:
-            LOG.warning("No mosaic available for %s; skipping", plate_id)
-            continue
-        paths[plate_id] = Path(session.path(relpath))
-
-    return paths
-
-
 def _write_fits(path: Path, data: np.ndarray, header: fits.Header, overwrite: bool) -> None:
     _prepare_output_path(path, overwrite)
     fits.PrimaryHDU(data=data.astype(np.float32), header=header).writeto(path, overwrite=overwrite)
 
 
-def build_mosaic(config: BuildConfig) -> dict[str, Any]:
-    candidates = discover_candidate_plates(config)
+def _candidates_from_manifest(manifest_path: Path) -> tuple[list[CandidatePlate], dict[str, Path]]:
+    """Load plate candidates and local paths from a prior build manifest, bypassing discovery and download."""
+    import json as _json
+    data = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidates: list[CandidatePlate] = []
+    mosaic_paths: dict[str, Path] = {}
+    for p in data.get("plates", []):
+        plate_id = p["plate_id"]
+        local_path = Path(p["local_mosaic_path"])
+        if not local_path.exists():
+            LOG.warning("Cached mosaic not found, skipping: %s", local_path)
+            continue
+        candidates.append(CandidatePlate(
+            plate_id=plate_id,
+            obs_date_jd=p["obs_date_jd"],
+            n_wcs_solutions=p.get("n_wcs_solutions", 1),
+            selected_at_points=p.get("selected_at_points", 1),
+        ))
+        mosaic_paths[plate_id] = local_path
     if not candidates:
-        raise RuntimeError("no DASCH plates matched the requested sky region and date constraints")
+        raise RuntimeError(f"no valid plate entries found in manifest {manifest_path}")
+    LOG.info("Loaded %d plates from manifest %s", len(candidates), manifest_path.name)
+    return candidates, mosaic_paths
 
-    mosaic_paths = _download_mosaic_paths(
-        session_root=config.session_root,
-        plate_ids=[c.plate_id for c in candidates],
-        binning=config.binning,
-    )
-    candidates = [c for c in candidates if c.plate_id in mosaic_paths]
-    if not candidates:
-        raise RuntimeError("no mosaics could be downloaded for the selected plates")
+
+def build_mosaic(config: BuildConfig) -> dict[str, Any]:
+    if config.from_manifest is not None:
+        candidates, mosaic_paths = _candidates_from_manifest(config.from_manifest)
+    else:
+        candidates = discover_candidate_plates(config)
+        if not candidates:
+            raise RuntimeError("no DASCH plates matched the requested sky region and date constraints")
+
+        mosaic_paths = download_mosaic_paths(
+            session_root=config.session_root,
+            plate_ids=[c.plate_id for c in candidates],
+            binning=config.binning,
+        )
+        candidates = [c for c in candidates if c.plate_id in mosaic_paths]
+        if not candidates:
+            raise RuntimeError("no mosaics could be downloaded for the selected plates")
 
     pixel_scale_arcsec = config.pixel_scale_arcsec
     if pixel_scale_arcsec is None:
@@ -585,11 +203,12 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         all_obs_jds.append(candidate.obs_date_jd)
         all_names.append(mosaic_path.name)
 
-    # Solve global per-plate additive background offsets (Montage/ubercal approach).
-    # This prevents the drift that accumulates when plates are matched sequentially
-    # against the growing mosaic: instead every pairwise constraint is used at once.
-    LOG.info("Solving global background offsets across %d plates", len(candidates))
-    bg_offsets = _solve_global_bg_offsets(all_reprojected, all_good, all_names)
+    LOG.info("Solving global additive background offsets across %d plates", len(candidates))
+    bg_offsets = _solve_global_bg_offsets(
+        all_reprojected,
+        all_good,
+        all_names,
+    )
 
     # Pass 2: apply corrections and composite (oldest to newest; newest wins).
     mosaic = np.full(shape_out, np.nan, dtype=np.float32)
@@ -622,6 +241,22 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
                     + add_offset
                 ).astype(np.float32)
 
+        if i > 0 and int(np.count_nonzero(overlap)) >= 500:
+            coeffs = _fit_overlap_residual_surface(
+                reference=mosaic,
+                candidate=corrected,
+                overlap=overlap,
+                degree=_RESIDUAL_SURFACE_DEGREE,
+            )
+            if coeffs is not None:
+                surface = _evaluate_residual_surface(mosaic.shape, coeffs, degree=_RESIDUAL_SURFACE_DEGREE)
+                corrected = (corrected.astype(np.float64) + surface.astype(np.float64)).astype(np.float32)
+                LOG.info(
+                    "Residual surface correction for %s: degree=%d",
+                    all_names[i],
+                    _RESIDUAL_SURFACE_DEGREE,
+                )
+
         mosaic[good] = corrected[good]
         epoch_map[good] = obs_jd
 
@@ -634,6 +269,8 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
     header["DASCHPSC"] = (pixel_scale_arcsec, "Output pixel scale arcsec/pixel")
     header["DASCHQST"] = (config.query_step_deg, "Grid spacing deg used for plate discovery")
     header["DASCHBG"] = (int(config.subtract_background), "Per-plate background subtracted before stitch")
+    header["DASCHRS"] = (1, "Residual overlap surface correction enabled")
+    header["DASCHRDG"] = (_RESIDUAL_SURFACE_DEGREE, "Residual overlap surface polynomial degree")
     header.add_history("Built from DASCH value-added mosaics fetched through daschlab.")
     header.add_history("Each pixel shows the most recently acquired plate covering that point.")
 
@@ -660,6 +297,8 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         "binning": config.binning,
         "query_step_deg": config.query_step_deg,
         "subtract_background": config.subtract_background,
+        "residual_surface_enabled": True,
+        "residual_surface_degree": _RESIDUAL_SURFACE_DEGREE,
         "allow_multi_solution_plates": config.allow_multi_solution_plates,
         "plates": [
             {

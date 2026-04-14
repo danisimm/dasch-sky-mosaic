@@ -7,7 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from dasch_sky_mosaic.pipeline import BuildConfig, Region, build_mosaic, parse_cli_date_jd
+from dasch_sky_mosaic.fetch import BuildConfig, Region, parse_cli_date_jd
+from dasch_sky_mosaic.pipeline import build_mosaic
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -42,6 +43,11 @@ def _build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--preserve-native-background", action="store_true", help="Disable per-plate median background subtraction")
     build_parser.add_argument("--delete-base-mosaics", action="store_true", help="Delete cached base mosaics after building to free disk space")
     build_parser.add_argument("--max-plates", type=int, help="Optional hard cap on the number of selected plates")
+    build_parser.add_argument(
+        "--from-manifest",
+        type=Path,
+        help="Path to an existing build manifest JSON; bypasses API discovery and download, using the cached plate files listed in the manifest",
+    )
     build_parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output files")
     build_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging verbosity")
     return parser
@@ -78,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         delete_base_mosaics=args.delete_base_mosaics,
         overwrite=args.overwrite,
         max_plates=args.max_plates,
+        from_manifest=args.from_manifest,
     )
     log.info(
         "Starting DASCH mosaic build: center=(%.6f, %.6f) size=%.3fx%.3f deg binning=%d",

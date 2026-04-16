@@ -1,14 +1,17 @@
+# This file was generated with the assistance of GitHub Copilot (AI).
 from __future__ import annotations
 
 import csv
 import io
 import logging
 import math
+import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 
 import numpy as np
 import requests
@@ -51,6 +54,8 @@ class CandidatePlate:
     plate_id: str
     obs_date_jd: float
     n_wcs_solutions: int
+    n_exposures: int
+    preferred_solution_num: int | None
     selected_at_points: int
 
 
@@ -189,11 +194,24 @@ def _extract_solnum(row: dict[str, str]) -> int | None:
         return None
 
 
+def _extract_exposure_num(row: dict[str, str]) -> int | None:
+    for key in ("exposure_num", "exposureNum", "expnum", "exp_num"):
+        raw = row.get(key, "").strip()
+        if not raw or raw.lower() in ("nan", "none", "null", "--"):
+            continue
+        try:
+            return int(float(raw))
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
 @dataclass(frozen=True)
 class ExposureHit:
     plate_id: str
     obs_date_jd: float | None  # Julian Date of the exposure midpoint; None if unknown
     solnum: int | None         # WCS solution number; None means no scan-based WCS
+    exposure_num: int | None   # Exposure number; None when unavailable
     wcssource: str             # "imwcs" | "logbook" | "none"
     raw: dict[str, str]
 
@@ -239,10 +257,19 @@ class StarglassClient:
                 plate_id=plate_id,
                 obs_date_jd=_extract_obs_date_jd(record),
                 solnum=_extract_solnum(record),
+                exposure_num=_extract_exposure_num(record),
                 wcssource=record.get("wcssource", "").strip().lower(),
                 raw=record,
             ))
         return hits
+
+    def get_plate(self, plate_id: str) -> dict[str, Any]:
+        response = self._session.get(
+            f"{self._base_url}/plates/p/{quote(plate_id)}",
+            timeout=self._timeout_seconds,
+        )
+        response.raise_for_status()
+        return cast(dict[str, Any], response.json())
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +326,9 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
     query_points = iter_query_points(config.region, config.query_step_deg)
     LOG.info("Querying %d sky positions via %s", len(query_points), client.base_url)
 
-    plate_exposures: dict[str, list[tuple[float | None, int | None]]] = {}
+    plate_exposures: dict[str, list[tuple[float | None, int | None, int | None]]] = {}
     point_winner: dict[tuple[int, int], str] = {}
+    point_winner_solnum: dict[tuple[int, int], int | None] = {}
 
     for idx, (ra_deg, dec_deg) in enumerate(query_points, start=1):
         if _should_log_progress(idx, len(query_points)):
@@ -317,14 +345,16 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
         if config.earliest_jd is not None:
             eligible = [h for h in eligible if h.obs_date_jd is not None and h.obs_date_jd >= config.earliest_jd]
         for h in eligible:
-            plate_exposures.setdefault(h.plate_id, []).append((h.obs_date_jd, h.solnum))
+            plate_exposures.setdefault(h.plate_id, []).append((h.obs_date_jd, h.solnum, h.exposure_num))
         best = max(
             eligible,
             key=lambda h: h.obs_date_jd if h.obs_date_jd is not None else -1.0,
             default=None,
         )
         if best is not None:
-            point_winner[(round(ra_deg * 1000), round(dec_deg * 1000))] = best.plate_id
+            key = (round(ra_deg * 1000), round(dec_deg * 1000))
+            point_winner[key] = best.plate_id
+            point_winner_solnum[key] = best.solnum
 
     selection_counts = Counter(point_winner.values())
     LOG.info(
@@ -336,17 +366,49 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
     candidates: list[CandidatePlate] = []
     for plate_id, point_count in selection_counts.items():
         exposures = plate_exposures.get(plate_id, [])
-        solnums = {s for _, s in exposures if s is not None}
+        solnums = {s for _, s, _ in exposures if s is not None}
         n_wcs = len(solnums)
         if not config.allow_multi_solution_plates and n_wcs > 1:
             continue
-        valid_jds = [jd for jd, _ in exposures if jd is not None]
+
+        explicit_exposure_nums = {exp for _, _, exp in exposures if exp is not None}
+        if explicit_exposure_nums:
+            n_exposures = len(explicit_exposure_nums)
+        else:
+            # queryexps exposure IDs are not always present; approximate via
+            # distinct (obs_date_jd, solnum) combinations.
+            proxy_ids = {
+                (round(jd, 6), sol)
+                for jd, sol, _ in exposures
+                if jd is not None and sol is not None
+            }
+            n_exposures = max(1, len(proxy_ids))
+
+        if n_exposures > 1:
+            LOG.info(
+                "Skipping %s: plate has %d exposures",
+                plate_id,
+                n_exposures,
+            )
+            continue
+
+        valid_jds = [jd for jd, _, _ in exposures if jd is not None]
         if not valid_jds:
             continue
+
+        preferred_counter = Counter(
+            point_winner_solnum[key]
+            for key, winner_plate in point_winner.items()
+            if winner_plate == plate_id and point_winner_solnum.get(key) is not None
+        )
+        preferred_solution_num = preferred_counter.most_common(1)[0][0] if preferred_counter else None
+
         candidates.append(CandidatePlate(
             plate_id=plate_id,
             obs_date_jd=max(valid_jds),
             n_wcs_solutions=n_wcs,
+            n_exposures=n_exposures,
+            preferred_solution_num=preferred_solution_num,
             selected_at_points=point_count,
         ))
 
@@ -368,12 +430,17 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
 # Mosaic downloads via daschlab
 # ---------------------------------------------------------------------------
 
-def download_mosaic_paths(session_root: Path, plate_ids: list[str], binning: int) -> dict[str, Path]:
-    """Download DASCH plate mosaics via daschlab and return a plate_id -> local Path map."""
+def download_mosaic_paths(
+    session_root: Path,
+    plate_ids: list[str],
+    binning: int,
+    api_base: str,
+    api_key: str | None,
+) -> dict[str, Path]:
+    """Download DASCH FITS mosaics and return a plate_id -> local Path map."""
     session_root.mkdir(parents=True, exist_ok=True)
-    session = open_session(str(session_root))
     paths: dict[str, Path] = {}
-
+    session = open_session(str(session_root))
     for idx, plate_id in enumerate(plate_ids, start=1):
         if _should_log_progress(idx, len(plate_ids)):
             LOG.info(

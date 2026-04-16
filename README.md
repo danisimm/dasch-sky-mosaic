@@ -72,6 +72,9 @@ python -m dasch_sky_mosaic build `
 - `--preserve-native-background`: skip median background subtraction before coaddition.
 - `--delete-base-mosaics`: remove cached base mosaics after build to free disk space.
 
+Current implementation note:
+- FITS mode is fully supported.
+
 ## Output products
 
 - Main mosaic FITS with the requested output WCS.

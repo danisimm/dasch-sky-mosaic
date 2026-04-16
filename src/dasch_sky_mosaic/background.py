@@ -1,3 +1,4 @@
+# This file was generated with the assistance of GitHub Copilot (AI).
 from __future__ import annotations
 
 import logging

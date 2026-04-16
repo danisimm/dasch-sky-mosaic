@@ -1,3 +1,4 @@
+# This file was generated with the assistance of GitHub Copilot (AI).
 from __future__ import annotations
 
 import json
@@ -89,6 +90,8 @@ def _candidates_from_manifest(manifest_path: Path) -> tuple[list[CandidatePlate]
             plate_id=plate_id,
             obs_date_jd=p["obs_date_jd"],
             n_wcs_solutions=p.get("n_wcs_solutions", 1),
+            n_exposures=p.get("n_exposures", 1),
+            preferred_solution_num=p.get("preferred_solution_num"),
             selected_at_points=p.get("selected_at_points", 1),
         ))
         mosaic_paths[plate_id] = local_path
@@ -99,6 +102,8 @@ def _candidates_from_manifest(manifest_path: Path) -> tuple[list[CandidatePlate]
 
 
 def build_mosaic(config: BuildConfig) -> dict[str, Any]:
+    apply_background_matching = config.subtract_background
+
     if config.from_manifest is not None:
         candidates, mosaic_paths = _candidates_from_manifest(config.from_manifest)
     else:
@@ -110,6 +115,8 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
             session_root=config.session_root,
             plate_ids=[c.plate_id for c in candidates],
             binning=config.binning,
+            api_base=config.api_base,
+            api_key=config.api_key,
         )
         candidates = [c for c in candidates if c.plate_id in mosaic_paths]
         if not candidates:
@@ -162,7 +169,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         interior_native = _plate_interior_mask(image, binning=config.binning).astype(np.float32)
 
         image[~np.isfinite(image)] = np.nan
-        if config.subtract_background:
+        if apply_background_matching:
             bg_model = _fit_plate_background(image, degree=2)
             image -= bg_model
             bg_template_native = bg_model - np.nanmedian(bg_model)
@@ -203,12 +210,16 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         all_obs_jds.append(candidate.obs_date_jd)
         all_names.append(mosaic_path.name)
 
-    LOG.info("Solving global additive background offsets across %d plates", len(candidates))
-    bg_offsets = _solve_global_bg_offsets(
-        all_reprojected,
-        all_good,
-        all_names,
-    )
+    if apply_background_matching:
+        LOG.info("Solving global additive background offsets across %d plates", len(candidates))
+        bg_offsets = _solve_global_bg_offsets(
+            all_reprojected,
+            all_good,
+            all_names,
+        )
+    else:
+        LOG.info("Skipping background matching")
+        bg_offsets = [0.0] * len(all_reprojected)
 
     # Pass 2: apply corrections and composite (oldest to newest; newest wins).
     mosaic = np.full(shape_out, np.nan, dtype=np.float32)
@@ -220,7 +231,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         # Refine correction against already-placed neighbors using overlap only.
         # This directly targets seam agreement and damps over/under vignette subtraction.
         overlap = good & np.isfinite(mosaic)
-        if config.subtract_background and i > 0 and int(np.count_nonzero(overlap)) >= 500:
+        if apply_background_matching and i > 0 and int(np.count_nonzero(overlap)) >= 500:
             gain, add_offset, matched = _estimate_overlap_template_refinement(
                 reference=mosaic,
                 candidate=corrected,
@@ -268,12 +279,11 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
     header["DASCHBIN"] = (config.binning, "DASCH mosaic binning level")
     header["DASCHPSC"] = (pixel_scale_arcsec, "Output pixel scale arcsec/pixel")
     header["DASCHQST"] = (config.query_step_deg, "Grid spacing deg used for plate discovery")
-    header["DASCHBG"] = (int(config.subtract_background), "Per-plate background subtracted before stitch")
+    header["DASCHBG"] = (int(apply_background_matching), "Per-plate background subtracted before stitch")
     header["DASCHRS"] = (1, "Residual overlap surface correction enabled")
     header["DASCHRDG"] = (_RESIDUAL_SURFACE_DEGREE, "Residual overlap surface polynomial degree")
     header.add_history("Built from DASCH value-added mosaics fetched through daschlab.")
     header.add_history("Each pixel shows the most recently acquired plate covering that point.")
-
     _write_fits(config.output_fits, mosaic, header, overwrite=config.overwrite)
 
     if config.epoch_fits is not None:
@@ -296,7 +306,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         "pixel_scale_arcsec": pixel_scale_arcsec,
         "binning": config.binning,
         "query_step_deg": config.query_step_deg,
-        "subtract_background": config.subtract_background,
+        "subtract_background": apply_background_matching,
         "residual_surface_enabled": True,
         "residual_surface_degree": _RESIDUAL_SURFACE_DEGREE,
         "allow_multi_solution_plates": config.allow_multi_solution_plates,
@@ -306,6 +316,8 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
                 "obs_date": jd_to_iso(c.obs_date_jd),
                 "obs_date_jd": c.obs_date_jd,
                 "n_wcs_solutions": c.n_wcs_solutions,
+                "n_exposures": c.n_exposures,
+                "preferred_solution_num": c.preferred_solution_num,
                 "selected_at_points": c.selected_at_points,
                 "local_mosaic_path": os.fspath(mosaic_paths[c.plate_id]),
             }

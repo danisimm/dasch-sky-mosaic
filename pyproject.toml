@@ -12,6 +12,7 @@ dependencies = [
   "astropy>=6.1",
   "daschlab>=0.1.dev0",
   "numpy>=2.0",
+  "pillow>=10.0",
   "python-dotenv>=1.0",
   "reproject>=0.15",
   "requests>=2.32",

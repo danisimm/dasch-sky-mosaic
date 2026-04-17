@@ -6,13 +6,15 @@ import logging
 import math
 import os
 import shutil
+import warnings
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import FITSFixedWarning, WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from reproject import reproject_interp
 
@@ -38,6 +40,46 @@ LOG = logging.getLogger(__name__)
 _RESIDUAL_SURFACE_DEGREE = 1
 
 
+@contextmanager
+def _ignore_fits_fixed_warnings():
+    """Suppress non-fatal FITS header normalization warnings from Astropy.
+
+    DASCH source mosaics commonly carry legacy keywords such as RADECSYS and
+    DATE-OBS values that Astropy normalizes while constructing WCS objects.
+    These warnings are expected for this dataset and do not affect the mosaic
+    build, so keep them out of normal CLI output while leaving other warnings
+    visible.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FITSFixedWarning)
+        yield
+
+
+def _read_first_image_hdu(mosaic_path: Path) -> tuple[fits.Header, np.ndarray]:
+    """Return header+data from the first HDU that contains 2D image data.
+
+    This handles both regular FITS files and compressed FITS (.fit.fz) where
+    the science image often lives in an extension rather than the primary HDU.
+    """
+    with fits.open(mosaic_path, memmap=True) as hdul:
+        for i in range(len(hdul)):
+            hdu = cast(Any, hdul[i])
+            raw = getattr(hdu, "data", None)
+            if raw is None:
+                continue
+            arr = np.asarray(raw)
+            if arr.ndim < 2:
+                continue
+            if arr.ndim > 2:
+                arr = np.squeeze(arr)
+                if arr.ndim != 2:
+                    continue
+            header = hdu.header.copy()
+            image = np.array(arr, dtype=np.float32, copy=True)
+            return header, image
+    raise RuntimeError(f"no 2D image HDU found in {mosaic_path}")
+
+
 def _build_output_wcs(region: Region, projection: str, pixel_scale_arcsec: float) -> tuple[WCS, tuple[int, int]]:
     pixel_scale_deg = pixel_scale_arcsec / 3600.0
     naxis1 = max(1, math.ceil(region.width_deg / pixel_scale_deg))
@@ -52,9 +94,8 @@ def _build_output_wcs(region: Region, projection: str, pixel_scale_arcsec: float
 
 
 def _native_pixel_scale_arcsec(mosaic_path: Path) -> float:
-    with fits.open(mosaic_path, memmap=True) as hdul:
-        primary_hdu = hdul[0]  # type: ignore[index]
-        header = primary_hdu.header.copy()  # type: ignore[attr-defined]
+    header, _ = _read_first_image_hdu(mosaic_path)
+    with _ignore_fits_fixed_warnings():
         wcs = WCS(header)
     scales_deg = proj_plane_pixel_scales(wcs)
     scale_arcsec = float(np.mean(np.abs(scales_deg)) * 3600.0)
@@ -69,9 +110,36 @@ def _prepare_output_path(path: Path, overwrite: bool) -> None:
         raise FileExistsError(f"refusing to overwrite existing file: {path}")
 
 
+def _ensure_wwt_rotation_keywords(header: fits.Header) -> fits.Header:
+    """Add explicit rotation/CD keywords for FITS readers that require them.
+
+    WWT Desktop's FITS parser does not treat CDELT+CRPIX+CRVAL alone as a
+    complete WCS. It also requires either CROTA2 or a full CD matrix in order
+    to mark the image as having valid rotation metadata.
+    """
+    updated = header.copy()
+    cdelt1 = cast(float | str | None, updated.get("CDELT1"))
+    cdelt2 = cast(float | str | None, updated.get("CDELT2"))
+    has_cd = all(key in updated for key in ("CD1_1", "CD1_2", "CD2_1", "CD2_2"))
+
+    if cdelt1 is not None and cdelt2 is not None and not has_cd:
+        updated["CD1_1"] = (float(cdelt1), "WCS matrix element 1_1")
+        updated["CD1_2"] = (0.0, "WCS matrix element 1_2")
+        updated["CD2_1"] = (0.0, "WCS matrix element 2_1")
+        updated["CD2_2"] = (float(cdelt2), "WCS matrix element 2_2")
+
+    if "CROTA2" not in updated:
+        updated["CROTA2"] = (0.0, "Image rotation angle in degrees")
+
+    return updated
+
+
 def _write_fits(path: Path, data: np.ndarray, header: fits.Header, overwrite: bool) -> None:
     _prepare_output_path(path, overwrite)
-    fits.PrimaryHDU(data=data.astype(np.float32), header=header).writeto(path, overwrite=overwrite)
+    fits.PrimaryHDU(
+        data=data.astype(np.float32),
+        header=_ensure_wwt_rotation_keywords(header),
+    ).writeto(path, overwrite=overwrite)
 
 
 def _candidates_from_manifest(manifest_path: Path) -> tuple[list[CandidatePlate], dict[str, Path]]:
@@ -161,9 +229,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
             jd_to_iso(candidate.obs_date_jd),
             candidate.obs_date_jd,
         )
-        with fits.open(mosaic_path, memmap=True) as hdul:
-            plate_header = hdul[0].header.copy() # type: ignore
-            image = np.array(hdul[0].data, dtype=np.float32, copy=True) # type: ignore
+        plate_header, image = _read_first_image_hdu(mosaic_path)
 
         # Build interior support from raw plate values before any intensity transforms.
         interior_native = _plate_interior_mask(image, binning=config.binning).astype(np.float32)
@@ -181,25 +247,26 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         else:
             bg_template_native = np.zeros_like(image, dtype=np.float32)
 
-        reprojected, footprint = reproject_interp(
-            (image, plate_header),
-            output_projection=output_wcs,
-            shape_out=shape_out,
-            return_footprint=True,
-        )
+        with _ignore_fits_fixed_warnings():
+            reprojected, footprint = reproject_interp(
+                (image, plate_header),
+                output_projection=output_wcs,
+                shape_out=shape_out,
+                return_footprint=True,
+            )
 
-        interior_proj, _ = reproject_interp(
-            (interior_native, plate_header),
-            output_projection=output_wcs,
-            shape_out=shape_out,
-            return_footprint=True,
-        )
-        template_proj, _ = reproject_interp(
-            (bg_template_native, plate_header),
-            output_projection=output_wcs,
-            shape_out=shape_out,
-            return_footprint=True,
-        )
+            interior_proj, _ = reproject_interp(
+                (interior_native, plate_header),
+                output_projection=output_wcs,
+                shape_out=shape_out,
+                return_footprint=True,
+            )
+            template_proj, _ = reproject_interp(
+                (bg_template_native, plate_header),
+                output_projection=output_wcs,
+                shape_out=shape_out,
+                return_footprint=True,
+            )
 
         # Reprojected binary masks are interpolated, so require strong-but-not-perfect support.
         good = np.isfinite(reprojected) & (footprint > 0.2) & np.isfinite(interior_proj) & (interior_proj > 0.1)
@@ -279,10 +346,11 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
     header["DASCHBIN"] = (config.binning, "DASCH mosaic binning level")
     header["DASCHPSC"] = (pixel_scale_arcsec, "Output pixel scale arcsec/pixel")
     header["DASCHQST"] = (config.query_step_deg, "Grid spacing deg used for plate discovery")
+    header["DASCHSRC"] = ("mosaic_package", "Mosaic download source")
     header["DASCHBG"] = (int(apply_background_matching), "Per-plate background subtracted before stitch")
     header["DASCHRS"] = (1, "Residual overlap surface correction enabled")
     header["DASCHRDG"] = (_RESIDUAL_SURFACE_DEGREE, "Residual overlap surface polynomial degree")
-    header.add_history("Built from DASCH value-added mosaics fetched through daschlab.")
+    header.add_history("Built from DASCH mosaics fetched via Starglass mosaic_package base_fits_url.")
     header.add_history("Each pixel shows the most recently acquired plate covering that point.")
     _write_fits(config.output_fits, mosaic, header, overwrite=config.overwrite)
 
@@ -306,6 +374,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         "pixel_scale_arcsec": pixel_scale_arcsec,
         "binning": config.binning,
         "query_step_deg": config.query_step_deg,
+        "mosaic_source": "mosaic_package",
         "subtract_background": apply_background_matching,
         "residual_surface_enabled": True,
         "residual_surface_degree": _RESIDUAL_SURFACE_DEGREE,

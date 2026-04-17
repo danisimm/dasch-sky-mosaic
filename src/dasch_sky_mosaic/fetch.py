@@ -6,19 +6,21 @@ import io
 import logging
 import math
 import os
+import shutil
+import subprocess
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import numpy as np
 import requests
+from astropy.io import fits
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.time import Time
-from daschlab import open_session
 
 try:
     from erfa import ErfaWarning
@@ -271,6 +273,15 @@ class StarglassClient:
         response.raise_for_status()
         return cast(dict[str, Any], response.json())
 
+    def get_mosaic_package(self, plate_id: str, binning: int) -> dict[str, Any]:
+        response = self._session.post(
+            f"{self._base_url}/dasch/dr7/mosaic_package",
+            json={"plate_id": plate_id, "binning": binning},
+            timeout=self._timeout_seconds,
+        )
+        response.raise_for_status()
+        return cast(dict[str, Any], response.json())
+
 
 # ---------------------------------------------------------------------------
 # Plate discovery
@@ -437,10 +448,16 @@ def download_mosaic_paths(
     api_base: str,
     api_key: str | None,
 ) -> dict[str, Path]:
-    """Download DASCH FITS mosaics and return a plate_id -> local Path map."""
+    """Download DASCH FITS mosaics via Starglass mosaic_package.
+
+    The endpoint returns a base FITS URL, often as a compressed `.fit.fz` file,
+    which is automatically funpacked to an ordinary `.fits` file before use.
+    """
     session_root.mkdir(parents=True, exist_ok=True)
+    mosaic_dir = session_root / "mosaic_package"
+    mosaic_dir.mkdir(parents=True, exist_ok=True)
+    client = StarglassClient(api_base=api_base, api_key=api_key)
     paths: dict[str, Path] = {}
-    session = open_session(str(session_root))
     for idx, plate_id in enumerate(plate_ids, start=1):
         if _should_log_progress(idx, len(plate_ids)):
             LOG.info(
@@ -449,11 +466,96 @@ def download_mosaic_paths(
                 len(plate_ids),
                 (100.0 * idx) / max(1, len(plate_ids)),
             )
-        LOG.info("Fetching DASCH mosaic for %s", plate_id)
-        relpath = session.mosaic(plate_id, binning)
-        if relpath is None:
-            LOG.warning("No mosaic available for %s; skipping", plate_id)
+        LOG.info("Fetching DASCH mosaic for %s via Starglass mosaic_package", plate_id)
+        try:
+            package = client.get_mosaic_package(plate_id=plate_id, binning=binning)
+            base_url = str(
+                package.get("base_fits_url")
+                or package.get("baseFitsUrl")
+                or ""
+            ).strip()
+            if not base_url:
+                LOG.warning(
+                    "No base FITS URL in mosaic_package response for %s; skipping",
+                    plate_id,
+                )
+                continue
+            remote_name = Path(unquote(urlsplit(base_url).path)).name
+            if remote_name:
+                local_name = remote_name
+                if not local_name.lower().startswith(plate_id.lower()):
+                    local_name = f"{plate_id}_{local_name}"
+            else:
+                local_name = f"{plate_id}_bin{binning}.fits"
+            local_path = mosaic_dir / local_name
+            if local_path.exists():
+                LOG.info("Reusing cached mosaic_package file for %s: %s", plate_id, local_path.name)
+                paths[plate_id] = _funpack_mosaic_if_needed(local_path)
+                continue
+            with requests.get(base_url, stream=True, timeout=180.0) as response:
+                response.raise_for_status()
+                with local_path.open("wb") as f_out:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if chunk:
+                            f_out.write(chunk)
+            paths[plate_id] = _funpack_mosaic_if_needed(local_path)
+        except requests.RequestException as exc:
+            LOG.warning("mosaic_package download failed for %s: %s", plate_id, exc)
             continue
-        paths[plate_id] = Path(session.path(relpath))
-
     return paths
+
+
+def _funpack_mosaic_if_needed(path: Path) -> Path:
+    """Return an uncompressed FITS path, funpacking .fz files when necessary."""
+    if path.suffix.lower() != ".fz":
+        return path
+
+    out_path = path.with_suffix("")
+    if out_path.suffix.lower() == ".fit":
+        out_path = out_path.with_suffix(".fits")
+    elif out_path.suffix.lower() != ".fits":
+        out_path = out_path.with_name(out_path.name + ".fits")
+
+    if out_path.exists():
+        return out_path
+
+    funpack_exe = shutil.which("funpack")
+    if funpack_exe:
+        LOG.info("Decompressing %s with funpack", path.name)
+        result = subprocess.run(
+            [funpack_exe, "-O", os.fspath(out_path), os.fspath(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and out_path.exists():
+            return out_path
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        detail = stderr or stdout or f"exit code {result.returncode}"
+        LOG.warning("funpack failed for %s (%s); falling back to astropy", path.name, detail)
+
+    # Fallback for environments without the cfitsio funpack binary.
+    LOG.info("Decompressing %s with astropy fallback", path.name)
+    with fits.open(path, memmap=False) as hdul:
+        image_hdu = None
+        for hdu in hdul:
+            raw = getattr(hdu, "data", None)
+            if raw is None:
+                continue
+            arr = np.asarray(raw)
+            if arr.ndim < 2:
+                continue
+            if arr.ndim > 2:
+                arr = np.squeeze(arr)
+                if arr.ndim != 2:
+                    continue
+            image_hdu = fits.PrimaryHDU(
+                data=np.array(arr, copy=True),
+                header=cast(Any, hdu).header.copy(),
+            )
+            break
+        if image_hdu is None:
+            raise RuntimeError(f"cannot decompress {path}: no 2D image HDU found")
+        fits.HDUList([image_hdu]).writeto(out_path, overwrite=True)
+    return out_path

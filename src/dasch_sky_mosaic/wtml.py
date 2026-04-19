@@ -11,6 +11,7 @@ from typing import Any
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
+from wwt_data_formats.imageset import ImageSet as WwtImageSet
 
 from dasch_sky_mosaic.fetch import Region, download_mosaic_paths, parse_cli_date_jd
 from dasch_sky_mosaic.plate_photos import PlatePhotoConfig, discover_and_download_plate_photos
@@ -65,7 +66,7 @@ def _discover_or_load_photos(config: WtmlBuildConfig) -> dict[str, Any]:
     return discover_and_download_plate_photos(photo_cfg)
 
 
-def _load_plate_wcs(mosaic_path: Path) -> tuple[WCS, tuple[int, int], float]:
+def _load_plate_wcs(mosaic_path: Path) -> tuple[Any, WCS, tuple[int, int], float, "Any"]:
     with fits.open(mosaic_path, memmap=True) as hdul:
         hdu = hdul[0]  # type: ignore[index]
         header = hdu.header.copy()  # type: ignore[attr-defined]
@@ -73,48 +74,224 @@ def _load_plate_wcs(mosaic_path: Path) -> tuple[WCS, tuple[int, int], float]:
         if data is None:
             raise RuntimeError(f"missing image data in {mosaic_path}")
         shape = (int(data.shape[0]), int(data.shape[1]))
+        # Make a copy of data to keep it in memory after file is closed
+        data_copy = data.copy()
     wcs = WCS(header)
+    wcs_header = wcs.to_header(relax=True)
     scale_deg = float(abs(proj_plane_pixel_scales(wcs).mean()))
-    return wcs, shape, scale_deg
+    return wcs_header, wcs, shape, scale_deg, data_copy
 
 
 def _next_pow2(x: int) -> int:
     return 1 if x <= 1 else 1 << (x - 1).bit_length()
 
 
-def _prepare_photo_for_wcs(source_photo: Path, shape: tuple[int, int]) -> "Any":
+def _astroalign_find_transform(
+    alignment_source: "Any",
+    fits_data: "Any",
+) -> tuple["Any" | None, int, str]:
+    """Find a similarity transform from a plate-photo image to FITS pixels.
+
+    Returns (transform, n_matches, mode_label).
+    """
+    try:
+        import astroalign as aa
+        import numpy as np
+    except ImportError:
+        LOG.warning("Astroalign alignment unavailable; missing dependencies.")
+        return None, 0, "unavailable"
+
+    def _normalize(img: "Any") -> "Any":
+        p1, p99 = np.percentile(img, (1.0, 99.0))
+        if p99 <= p1:
+            return np.zeros_like(img, dtype=np.float32)
+        img = np.clip(img, p1, p99)
+        return ((img - p1) / (p99 - p1)).astype(np.float32)
+
+    try:
+        src_rgb = np.array(alignment_source, dtype=np.float32)
+        src_gray = _normalize(src_rgb[:, :, 0])
+        fits_norm = _normalize(np.array(fits_data, dtype=np.float32))
+
+        best_transform: Any = None
+        best_label = ""
+        best_matches = 0
+
+        # Inversion is tested on the plate-photo source, not on FITS.
+        for label, source in (("native", src_gray), ("inverted", 1.0 - src_gray)):
+            try:
+                transform, (src_pts, dst_pts) = aa.find_transform(
+                    source,
+                    fits_norm,
+                    max_control_points=150,
+                    detection_sigma=4,
+                    min_area=3,
+                )
+            except Exception:
+                continue
+
+            n_matches = int(len(src_pts))
+            if n_matches > best_matches:
+                best_matches = n_matches
+                best_transform = transform
+                best_label = label
+
+        if best_transform is None or best_matches < 6:
+            return None, 0, "none"
+
+        LOG.info(
+            "Astroalign alignment: mode=%s matches=%d scale=%.5f rot_deg=%.3f tx=%.2f ty=%.2f",
+            best_label,
+            best_matches,
+            float(best_transform.scale),
+            float(np.degrees(best_transform.rotation)),
+            float(best_transform.translation[0]),
+            float(best_transform.translation[1]),
+        )
+        return best_transform, best_matches, best_label
+    except Exception:
+        LOG.exception("Astroalign alignment failed; using unaligned crop.")
+        return None, 0, "error"
+
+
+def _compose_wcs_header_from_affine(reference_wcs: WCS, affine_a: "Any", affine_t: "Any") -> dict[str, Any]:
+    """Compose an image->reference affine transform into a FITS WCS header.
+
+    The affine maps source image x/y pixel coordinates (0-based) into reference
+    FITS x/y pixel coordinates (0-based).
+    """
+    import numpy as np
+
+    if reference_wcs.wcs.has_cd():
+        ref_cd = np.array(reference_wcs.wcs.cd, dtype=np.float64)
+    else:
+        ref_cd = np.array(reference_wcs.wcs.get_pc(), dtype=np.float64) @ np.diag(
+            np.array(reference_wcs.wcs.cdelt, dtype=np.float64)
+        )
+
+    ones = np.ones(2, dtype=np.float64)
+    affine_a = np.array(affine_a, dtype=np.float64)
+    affine_t = np.array(affine_t, dtype=np.float64)
+    cd_src = ref_cd @ affine_a
+    b = affine_t + ones - affine_a @ ones
+    crpix_src = np.linalg.solve(affine_a, np.array(reference_wcs.wcs.crpix, dtype=np.float64) - b)
+
+    header = reference_wcs.to_header(relax=True)
+    for key in list(header.keys()):
+        if key.startswith("PC") or key.startswith("CD"):
+            del header[key]
+    for key in ("CDELT1", "CDELT2"):
+        if key in header:
+            del header[key]
+
+    header["CRPIX1"] = float(crpix_src[0])
+    header["CRPIX2"] = float(crpix_src[1])
+    header["CD1_1"] = float(cd_src[0, 0])
+    header["CD1_2"] = float(cd_src[0, 1])
+    header["CD2_1"] = float(cd_src[1, 0])
+    header["CD2_2"] = float(cd_src[1, 1])
+    return dict(header)
+
+
+def _prepare_photo_for_wcs(
+    source_photo: Path,
+    reference_wcs: WCS,
+    shape: tuple[int, int],
+    fits_data: "Any" = None,
+) -> tuple[Path, int, int, dict[str, Any], dict[str, Any]]:
     """Map a raw plate photo onto the FITS WCS pixel geometry.
 
-    We do a center-preserving cover fit, with optional 90-degree rotation if that
-    better matches the target aspect ratio. This keeps a direct photo workflow
-    while ensuring tile pixels correspond to the same sky footprint as the WCS.
+    When FITS data is available, we compare two parity branches only: the source
+    image and its horizontal mirror. Astroalign then solves rotation, translation,
+    and uniform scale within each branch, and we keep the stronger match.
     """
     try:
         from PIL import Image
+        import numpy as np
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("Pillow is required for WTML tile generation. Install pillow>=10.") from exc
+
+    import numpy as np
 
     target_h, target_w = shape
     with Image.open(source_photo) as opened:
         src = opened.convert("RGB")
+    src_w, src_h = src.size
 
-    def _score(candidate: "Any") -> float:
+    def _cover_resize(candidate: "Any") -> tuple["Any", float]:
         c_w, c_h = candidate.size
-        src_aspect = c_w / max(1.0, c_h)
-        dst_aspect = target_w / max(1.0, target_h)
-        return abs(math.log(max(1e-12, src_aspect / dst_aspect)))
+        scale = max(target_w / max(1, c_w), target_h / max(1, c_h))
+        resized_w = max(1, int(round(c_w * scale)))
+        resized_h = max(1, int(round(c_h * scale)))
+        resized = candidate.resize((resized_w, resized_h), resample=Image.Resampling.BICUBIC)
+        return resized, float(scale)
 
-    candidates = [src, src.transpose(Image.Transpose.ROTATE_90)]
-    best = min(candidates, key=_score)
-    b_w, b_h = best.size
-    scale = max(target_w / max(1, b_w), target_h / max(1, b_h))
-    resized_w = max(1, int(round(b_w * scale)))
-    resized_h = max(1, int(round(b_h * scale)))
-    resized = best.resize((resized_w, resized_h), resample=Image.Resampling.BICUBIC)
+    def _branch_affine(branch: str, width_px: int, scale: float) -> tuple["Any", "Any"]:
+        if branch == "source_mirror":
+            base_a = np.array([[-1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+            base_t = np.array([width_px - 1.0, 0.0], dtype=np.float64)
+        else:
+            base_a = np.eye(2, dtype=np.float64)
+            base_t = np.zeros(2, dtype=np.float64)
+        return scale * base_a, scale * base_t
 
-    x0 = max(0, (resized_w - target_w) // 2)
-    y0 = max(0, (resized_h - target_h) // 2)
-    return resized.crop((x0, y0, x0 + target_w, y0 + target_h))
+    if fits_data is not None:
+        parity_candidates = [
+            ("source", src),
+            ("source_mirror", src.transpose(Image.Transpose.FLIP_LEFT_RIGHT)),
+        ]
+        best_header = None
+        best_label = ""
+        best_matches = -1
+        best_meta: dict[str, Any] | None = None
+
+        for label, candidate in parity_candidates:
+            resized, resize_scale = _cover_resize(candidate)
+            transform, n_matches, mode_label = _astroalign_find_transform(resized, fits_data)
+            if transform is None:
+                continue
+
+            branch_a, branch_t = _branch_affine(label, src_w, resize_scale)
+            total_a = np.array(transform.params[:2, :2], dtype=np.float64) @ branch_a
+            total_t = np.array(transform.params[:2, 2], dtype=np.float64) + np.array(transform.params[:2, :2], dtype=np.float64) @ branch_t
+            header = _compose_wcs_header_from_affine(reference_wcs, total_a, total_t)
+
+            if n_matches > best_matches:
+                best_header = header
+                best_label = f"{label}/{mode_label}"
+                best_matches = n_matches
+                best_meta = {
+                    "parity": label,
+                    "mode": mode_label,
+                    "matches": n_matches,
+                    "transform_scale": float(transform.scale),
+                    "transform_rotation_deg": float(np.degrees(transform.rotation)),
+                    "transform_translation": [
+                        float(transform.translation[0]),
+                        float(transform.translation[1]),
+                    ],
+                }
+
+        if best_header is not None and best_meta is not None:
+            LOG.info("Parity pick: %s (matches=%d)", best_label, best_matches)
+            return source_photo, src_w, src_h, best_header, best_meta
+
+    resized, resize_scale = _cover_resize(src)
+    x0 = max(0, min((resized.width - target_w) // 2, resized.width - target_w))
+    y0 = max(0, min((resized.height - target_h) // 2, resized.height - target_h))
+    fallback_a = resize_scale * np.eye(2, dtype=np.float64)
+    fallback_t = np.array([-x0, -y0], dtype=np.float64)
+    fallback_header = _compose_wcs_header_from_affine(reference_wcs, fallback_a, fallback_t)
+    fallback_meta = {
+        "parity": "source",
+        "mode": "fallback",
+        "matches": 0,
+        "transform_scale": 1.0,
+        "transform_rotation_deg": 0.0,
+        "transform_translation": [float(-x0), float(-y0)],
+    }
+    LOG.info("Parity pick fallback: source")
+    return source_photo, src_w, src_h, fallback_header, fallback_meta
 
 
 def _write_aligned_photo(aligned_rgb: "Any", out_path: Path) -> Path:
@@ -123,22 +300,40 @@ def _write_aligned_photo(aligned_rgb: "Any", out_path: Path) -> Path:
     return out_path
 
 
+def _derive_skyimage_from_wcs(
+    header: dict[str, Any],
+    width_px: int,
+    height_px: int,
+) -> dict[str, float | bool]:
+    """Derive WWT SkyImage placement fields from FITS WCS and image dimensions."""
+    imgset = WwtImageSet()
+    imgset.tile_levels = 0
+    imgset.set_position_from_wcs(header, width=width_px, height=height_px)
+
+    return {
+        "base_degrees_per_tile": float(imgset.base_degrees_per_tile),
+        "bottoms_up": bool(imgset.bottoms_up),
+        "center_x": float(imgset.center_x),
+        "center_y": float(imgset.center_y),
+        "offset_x": float(imgset.offset_x),
+        "offset_y": float(imgset.offset_y),
+        "rotation_deg": float(imgset.rotation_deg),
+        "width_factor": float(imgset.width_factor),
+    }
+
+
 def _make_imageset_xml(
     plate_id: str,
     image_url: str,
-    center_ra_deg: float,
-    center_dec_deg: float,
-    shape: tuple[int, int],
-    scale_deg: float,
+    placement: dict[str, float | bool],
+    image_width_px: int,
+    image_height_px: int,
 ) -> ET.Element:
-    naxis2, naxis1 = shape
-    width_deg = max(1e-9, naxis1 * scale_deg)
-    height_deg = max(1e-9, naxis2 * scale_deg)
-    width_factor = naxis1 / max(1.0, naxis2)
-    # SkyImage anchors from an image origin unless an offset is supplied; shift by
-    # half-extents so the image center lands on (CenterX, CenterY).
-    offset_x_deg = width_deg * 0.5
-    offset_y_deg = height_deg * 0.5
+    center_ra_deg = float(placement["center_x"])
+    center_dec_deg = float(placement["center_y"])
+    base_deg_per_px = max(1e-12, float(placement["base_degrees_per_tile"]))
+    width_deg = image_width_px * base_deg_per_px
+    height_deg = image_height_px * base_deg_per_px
 
     place = ET.Element(
         "Place",
@@ -162,19 +357,21 @@ def _make_imageset_xml(
             "Url": image_url,
             "TileLevels": "0",
             "BaseTileLevel": "0",
-            "BaseDegreesPerTile": f"{height_deg:.12f}",
+            "BaseDegreesPerTile": f"{base_deg_per_px:.12f}",
             "FileType": ".jpg",
             "Projection": "SkyImage",
-            "BottomsUp": "False",
+            "BottomsUp": "True" if bool(placement["bottoms_up"]) else "False",
             "CenterX": f"{center_ra_deg:.8f}",
             "CenterY": f"{center_dec_deg:.8f}",
-            "OffsetX": f"{offset_x_deg:.8f}",
-            "OffsetY": f"{offset_y_deg:.8f}",
-            "Rotation": "0",
-            "Sparse": "True",
-            "WidthFactor": f"{width_factor:.8f}",
+            "OffsetX": f"{float(placement['offset_x']):.8f}",
+            "OffsetY": f"{float(placement['offset_y']):.8f}",
+            "Rotation": f"{float(placement['rotation_deg']):.8f}",
+            "Sparse": "False",
+            "WidthFactor": f"{float(placement['width_factor']):.8f}",
+            "QuadTreeMap": "",
         },
     )
+    ET.SubElement(imageset, "ThumbnailUrl")
     ET.SubElement(imageset, "Credits").text = "DASCH / Harvard College Observatory"
     ET.SubElement(imageset, "CreditsUrl").text = "https://dasch.cfa.harvard.edu/"
     ET.SubElement(imageset, "Description").text = f"Single-plate WTML entry for {plate_id}"
@@ -234,11 +431,15 @@ def build_wtml(config: WtmlBuildConfig) -> dict[str, Any]:
             )
             continue
 
-        wcs, shape, scale_deg = _load_plate_wcs(mosaic_path)
-        aligned_photo = _prepare_photo_for_wcs(photo_file.resolve(), shape)
-        aligned_dir = config.output_wtml.parent / f"{config.output_wtml.stem}_images"
-        aligned_path = _write_aligned_photo(aligned_photo, aligned_dir / f"{plate_id}.jpg")
-        image_uri = aligned_path.resolve().as_uri()
+        header, wcs, shape, scale_deg, fits_data = _load_plate_wcs(mosaic_path)
+        image_path, image_w, image_h, placement_header, alignment_meta = _prepare_photo_for_wcs(
+            photo_file.resolve(),
+            wcs,
+            shape,
+            fits_data=fits_data,
+        )
+        placement = _derive_skyimage_from_wcs(placement_header, image_w, image_h)
+        image_uri = image_path.resolve().as_uri()
         center_ra_deg = float(wcs.wcs.crval[0])
         center_dec_deg = float(wcs.wcs.crval[1])
 
@@ -246,10 +447,9 @@ def build_wtml(config: WtmlBuildConfig) -> dict[str, Any]:
             _make_imageset_xml(
                 plate_id=plate_id,
                 image_url=image_uri,
-                center_ra_deg=center_ra_deg,
-                center_dec_deg=center_dec_deg,
-                shape=shape,
-                scale_deg=scale_deg,
+                placement=placement,
+                image_width_px=image_w,
+                image_height_px=image_h,
             )
         )
 
@@ -257,12 +457,14 @@ def build_wtml(config: WtmlBuildConfig) -> dict[str, Any]:
             {
                 "plate_id": plate_id,
                 "local_photo_path": photo_path,
-                "aligned_photo_path": str(aligned_path),
+                "aligned_photo_path": str(image_path),
                 "wcs_mosaic_path": str(mosaic_path),
                 "center_ra_deg": center_ra_deg,
                 "center_dec_deg": center_dec_deg,
                 "pixel_scale_deg": scale_deg,
                 "shape": [shape[0], shape[1]],
+                "alignment": alignment_meta,
+                "skyimage_placement": placement,
             }
         )
 

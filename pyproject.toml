@@ -10,12 +10,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "astropy>=6.1",
+  "astroalign>=2.5",
   "daschlab>=0.1.dev0",
   "numpy>=2.0",
   "pillow>=10.0",
   "python-dotenv>=1.0",
   "reproject>=0.15",
   "requests>=2.32",
+  "scikit-image>=0.24",
+  "wwt-data-formats>=0.18",
 ]
 
 [project.scripts]

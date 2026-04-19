@@ -226,14 +226,20 @@ def _prepare_photo_for_wcs(
         resized = candidate.resize((resized_w, resized_h), resample=Image.Resampling.BICUBIC)
         return resized, float(scale)
 
-    def _branch_affine(branch: str, width_px: int, scale: float) -> tuple["Any", "Any"]:
+    def _branch_affine(
+        branch: str,
+        width_px: int,
+        scale: float,
+        crop_x: int,
+        crop_y: int,
+    ) -> tuple["Any", "Any"]:
         if branch == "source_mirror":
             base_a = np.array([[-1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
             base_t = np.array([width_px - 1.0, 0.0], dtype=np.float64)
         else:
             base_a = np.eye(2, dtype=np.float64)
             base_t = np.zeros(2, dtype=np.float64)
-        return scale * base_a, scale * base_t
+        return scale * base_a, scale * base_t - np.array([crop_x, crop_y], dtype=np.float64)
 
     if fits_data is not None:
         parity_candidates = [
@@ -247,11 +253,15 @@ def _prepare_photo_for_wcs(
 
         for label, candidate in parity_candidates:
             resized, resize_scale = _cover_resize(candidate)
-            transform, n_matches, mode_label = _astroalign_find_transform(resized, fits_data)
+            x0 = max(0, min((resized.width - target_w) // 2, resized.width - target_w))
+            y0 = max(0, min((resized.height - target_h) // 2, resized.height - target_h))
+            match_img = resized.crop((x0, y0, x0 + target_w, y0 + target_h))
+
+            transform, n_matches, mode_label = _astroalign_find_transform(match_img, fits_data)
             if transform is None:
                 continue
 
-            branch_a, branch_t = _branch_affine(label, src_w, resize_scale)
+            branch_a, branch_t = _branch_affine(label, src_w, resize_scale, x0, y0)
             total_a = np.array(transform.params[:2, :2], dtype=np.float64) @ branch_a
             total_t = np.array(transform.params[:2, 2], dtype=np.float64) + np.array(transform.params[:2, :2], dtype=np.float64) @ branch_t
             header = _compose_wcs_header_from_affine(reference_wcs, total_a, total_t)

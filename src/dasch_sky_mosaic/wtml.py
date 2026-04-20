@@ -353,6 +353,7 @@ def _make_imageset_xml(
             "RA": f"{center_ra_deg / 15.0:.8f}",
             "Dec": f"{center_dec_deg:.8f}",
             "ZoomLevel": f"{max(width_deg, height_deg) * 6.0:.6f}",
+            "Opacity": "100",
         },
     )
     fg = ET.SubElement(place, "ForegroundImageSet")

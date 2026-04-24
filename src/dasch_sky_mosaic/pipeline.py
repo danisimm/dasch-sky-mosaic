@@ -144,8 +144,7 @@ def _write_fits(path: Path, data: np.ndarray, header: fits.Header, overwrite: bo
 
 def _candidates_from_manifest(manifest_path: Path) -> tuple[list[CandidatePlate], dict[str, Path]]:
     """Load plate candidates and local paths from a prior build manifest, bypassing discovery and download."""
-    import json as _json
-    data = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
     candidates: list[CandidatePlate] = []
     mosaic_paths: dict[str, Path] = {}
     for p in data.get("plates", []):

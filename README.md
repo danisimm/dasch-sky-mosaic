@@ -156,6 +156,85 @@ Notes:
 - This is a first-pass WTML path focused on proving photo+WCS integration.
 - Mosaicing and advanced guardrails are intentionally deferred.
 
+## Plate ID -> WWT Launch URL (No Discovery, No Local FITS/JPG Files)
+
+Use `wwt-link` when you already have a `plate_id` and want a direct
+Worldwide Telescope launch URL generated in one step.
+
+This command:
+
+- Skips discovery entirely (plate ID is the only required scientific input).
+- Fetches plate-photo and mosaic-package metadata directly for the given plate.
+- Streams photo and FITS data in memory for alignment/WCS placement derivation.
+- Generates a ShowImage-style URL and wraps it in a WWT webclient launch URL.
+- Allows overriding the WWT-facing image URL so links can point to a display/proxy endpoint instead of a signed download URL.
+
+Example:
+
+```powershell
+python -m dasch_sky_mosaic wwt-link `
+  --plate-id dnb06613 `
+  --output-json data/output/dnb06613_wwt_link.json `
+  --overwrite
+```
+
+If your signed source URL behaves like a download-only link for WWT rendering,
+provide a WWT-facing URL directly:
+
+```powershell
+python -m dasch_sky_mosaic wwt-link `
+  --plate-id dnb06613 `
+  --wwt-image-url "https://your-site.example/wwt/plate-image/dnb06613.jpg" `
+  --output-json data/output/dnb06613_wwt_link.json `
+  --overwrite
+```
+
+Or use a template:
+
+```powershell
+python -m dasch_sky_mosaic wwt-link `
+  --plate-id dnb06613 `
+  --wwt-image-url-template "https://your-site.example/wwt/plate-image/{plate_id}.jpg" `
+  --output-json data/output/dnb06613_wwt_link.json `
+  --overwrite
+```
+
+Notes:
+
+- The source image URLs are short-lived (about 15 minutes).
+- The command never writes intermediate FITS/JPG alignment artifacts to disk.
+- `--output-json` is optional; if omitted, the launch URL is logged only.
+- `image_url` in output JSON is the fetched source URL; `wwt_image_url` is the URL actually embedded in WWT links.
+
+## In-Memory WWT Image Proxy (No Local Storage)
+
+If WWT does not render the presigned Starglass image URL directly, run the built-in
+proxy server. It fetches temporary Starglass image links in memory and re-serves
+them with display-friendly headers.
+
+Start the proxy:
+
+```powershell
+python -m dasch_sky_mosaic wwt-proxy --host 127.0.0.1 --port 8765
+```
+
+Endpoints:
+
+- `GET /wwt/plate-image/{plate_id}.jpg`
+  - Proxies the current full-plate image for `plate_id`
+  - No disk writes; response is streamed from memory
+- `GET /wwt/link?plate_id={plate_id}`
+  - Generates a launch-link JSON payload using the proxy image endpoint as `wwt_image_url`
+
+Example link generation via proxy endpoint:
+
+```text
+http://127.0.0.1:8765/wwt/link?plate_id=dnb06613
+```
+
+For production deployment, implement this endpoint in your website backend over HTTPS
+and use that URL as the `imageurl` in WWT links.
+
 ## Next step for Worldwide Telescope
 
 Once the stitched FITS looks right, convert it into a TOAST tile pyramid using a WWT-compatible tiler such as `toasty` or `wwt_data_formats`. This script is focused on the plate-selection, download, reprojection, and coaddition stage where WCS integrity matters most.

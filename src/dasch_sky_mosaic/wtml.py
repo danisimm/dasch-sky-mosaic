@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from astropy.io import fits
 from astropy.wcs import WCS
@@ -68,28 +67,36 @@ def _discover_or_load_photos(config: WtmlBuildConfig) -> dict[str, Any]:
 
 def _load_plate_wcs(mosaic_path: Path) -> tuple[Any, WCS, tuple[int, int], float, "Any"]:
     with fits.open(mosaic_path, memmap=True) as hdul:
-        hdu = hdul[0]  # type: ignore[index]
-        header = hdu.header.copy()  # type: ignore[attr-defined]
-        data = hdu.data  # type: ignore[attr-defined]
-        if data is None:
-            raise RuntimeError(f"missing image data in {mosaic_path}")
-        shape = (int(data.shape[0]), int(data.shape[1]))
-        # Make a copy of data to keep it in memory after file is closed
-        data_copy = data.copy()
+        header = None
+        data_copy = None
+        shape = None
+        for ext in hdul:
+            hdu = cast(Any, ext)
+            raw = getattr(hdu, "data", None)
+            if raw is None:
+                continue
+            data_arr = raw if hasattr(raw, "ndim") else None
+            if data_arr is None or data_arr.ndim < 2:
+                continue
+            if data_arr.ndim > 2:
+                continue
+            header = hdu.header.copy()
+            shape = (int(data_arr.shape[0]), int(data_arr.shape[1]))
+            # Keep a copy in memory so downstream alignment does not hold the FITS file open.
+            data_copy = data_arr.copy()
+            break
+        if header is None or shape is None or data_copy is None:
+            raise RuntimeError(f"missing 2D image data in {mosaic_path}")
     wcs = WCS(header)
     wcs_header = wcs.to_header(relax=True)
     scale_deg = float(abs(proj_plane_pixel_scales(wcs).mean()))
     return wcs_header, wcs, shape, scale_deg, data_copy
 
 
-def _next_pow2(x: int) -> int:
-    return 1 if x <= 1 else 1 << (x - 1).bit_length()
-
-
 def _astroalign_find_transform(
     alignment_source: "Any",
     fits_data: "Any",
-) -> tuple["Any" | None, int, str]:
+) -> tuple[Any | None, int, str]:
     """Find a similarity transform from a plate-photo image to FITS pixels.
 
     Returns (transform, n_matches, mode_label).
@@ -211,8 +218,6 @@ def _prepare_photo_for_wcs(
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("Pillow is required for WTML tile generation. Install pillow>=10.") from exc
 
-    import numpy as np
-
     target_h, target_w = shape
     with Image.open(source_photo) as opened:
         src = opened.convert("RGB")
@@ -302,12 +307,6 @@ def _prepare_photo_for_wcs(
     }
     LOG.info("Parity pick fallback: source")
     return source_photo, src_w, src_h, fallback_header, fallback_meta
-
-
-def _write_aligned_photo(aligned_rgb: "Any", out_path: Path) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    aligned_rgb.save(out_path, format="JPEG", quality=92)
-    return out_path
 
 
 def _derive_skyimage_from_wcs(

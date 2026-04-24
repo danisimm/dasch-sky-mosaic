@@ -295,6 +295,10 @@ def _clip_dec_deg(value: float) -> float:
     return max(-89.999999, min(89.999999, value))
 
 
+def _query_point_key(ra_deg: float, dec_deg: float) -> tuple[int, int]:
+    return (round(ra_deg * 1000), round(dec_deg * 1000))
+
+
 def _grid_axis(half_width_deg: float, spacing_deg: float) -> list[float]:
     if half_width_deg == 0:
         return [0.0]
@@ -321,7 +325,7 @@ def iter_query_points(region: Region, query_step_deg: float) -> list[tuple[float
     for ra_deg, dec_deg in points:
         if dec_deg > MAX_QUERY_DEC_DEG:
             continue
-        unique[(round(ra_deg * 1000), round(dec_deg * 1000))] = (ra_deg, dec_deg)
+        unique[_query_point_key(ra_deg, dec_deg)] = (ra_deg, dec_deg)
     return list(unique.values())
 
 
@@ -350,11 +354,18 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
                 (100.0 * idx) / max(1, len(query_points)),
             )
         hits = client.query_exposures(ra_deg=ra_deg, dec_deg=dec_deg)
-        eligible = [h for h in hits if h.has_imaging]
-        if config.as_of_jd is not None:
-            eligible = [h for h in eligible if h.obs_date_jd is not None and h.obs_date_jd <= config.as_of_jd]
-        if config.earliest_jd is not None:
-            eligible = [h for h in eligible if h.obs_date_jd is not None and h.obs_date_jd >= config.earliest_jd]
+        eligible: list[ExposureHit] = []
+        for hit in hits:
+            if not hit.has_imaging:
+                continue
+            obs_jd = hit.obs_date_jd
+            if obs_jd is None:
+                continue
+            if config.as_of_jd is not None and obs_jd > config.as_of_jd:
+                continue
+            if config.earliest_jd is not None and obs_jd < config.earliest_jd:
+                continue
+            eligible.append(hit)
         for h in eligible:
             plate_exposures.setdefault(h.plate_id, []).append((h.obs_date_jd, h.solnum, h.exposure_num))
         best = max(
@@ -363,7 +374,7 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
             default=None,
         )
         if best is not None:
-            key = (round(ra_deg * 1000), round(dec_deg * 1000))
+            key = _query_point_key(ra_deg, dec_deg)
             point_winner[key] = best.plate_id
             point_winner_solnum[key] = best.solnum
 
@@ -457,51 +468,55 @@ def download_mosaic_paths(
     mosaic_dir = session_root / "mosaic_package"
     mosaic_dir.mkdir(parents=True, exist_ok=True)
     client = StarglassClient(api_base=api_base, api_key=api_key)
+    file_session = requests.Session()
     paths: dict[str, Path] = {}
-    for idx, plate_id in enumerate(plate_ids, start=1):
-        if _should_log_progress(idx, len(plate_ids)):
-            LOG.info(
-                "Download progress: %d/%d plate mosaics (%.0f%%)",
-                idx,
-                len(plate_ids),
-                (100.0 * idx) / max(1, len(plate_ids)),
-            )
-        LOG.info("Fetching DASCH mosaic for %s via Starglass mosaic_package", plate_id)
-        try:
-            package = client.get_mosaic_package(plate_id=plate_id, binning=binning)
-            base_url = str(
-                package.get("base_fits_url")
-                or package.get("baseFitsUrl")
-                or ""
-            ).strip()
-            if not base_url:
-                LOG.warning(
-                    "No base FITS URL in mosaic_package response for %s; skipping",
-                    plate_id,
+    try:
+        for idx, plate_id in enumerate(plate_ids, start=1):
+            if _should_log_progress(idx, len(plate_ids)):
+                LOG.info(
+                    "Download progress: %d/%d plate mosaics (%.0f%%)",
+                    idx,
+                    len(plate_ids),
+                    (100.0 * idx) / max(1, len(plate_ids)),
                 )
-                continue
-            remote_name = Path(unquote(urlsplit(base_url).path)).name
-            if remote_name:
-                local_name = remote_name
-                if not local_name.lower().startswith(plate_id.lower()):
-                    local_name = f"{plate_id}_{local_name}"
-            else:
-                local_name = f"{plate_id}_bin{binning}.fits"
-            local_path = mosaic_dir / local_name
-            if local_path.exists():
-                LOG.info("Reusing cached mosaic_package file for %s: %s", plate_id, local_path.name)
+            LOG.info("Fetching DASCH mosaic for %s via Starglass mosaic_package", plate_id)
+            try:
+                package = client.get_mosaic_package(plate_id=plate_id, binning=binning)
+                base_url = str(
+                    package.get("base_fits_url")
+                    or package.get("baseFitsUrl")
+                    or ""
+                ).strip()
+                if not base_url:
+                    LOG.warning(
+                        "No base FITS URL in mosaic_package response for %s; skipping",
+                        plate_id,
+                    )
+                    continue
+                remote_name = Path(unquote(urlsplit(base_url).path)).name
+                if remote_name:
+                    local_name = remote_name
+                    if not local_name.lower().startswith(plate_id.lower()):
+                        local_name = f"{plate_id}_{local_name}"
+                else:
+                    local_name = f"{plate_id}_bin{binning}.fits"
+                local_path = mosaic_dir / local_name
+                if local_path.exists():
+                    LOG.info("Reusing cached mosaic_package file for %s: %s", plate_id, local_path.name)
+                    paths[plate_id] = _funpack_mosaic_if_needed(local_path)
+                    continue
+                with file_session.get(base_url, stream=True, timeout=180.0) as response:
+                    response.raise_for_status()
+                    with local_path.open("wb") as f_out:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            if chunk:
+                                f_out.write(chunk)
                 paths[plate_id] = _funpack_mosaic_if_needed(local_path)
+            except requests.RequestException as exc:
+                LOG.warning("mosaic_package download failed for %s: %s", plate_id, exc)
                 continue
-            with requests.get(base_url, stream=True, timeout=180.0) as response:
-                response.raise_for_status()
-                with local_path.open("wb") as f_out:
-                    for chunk in response.iter_content(chunk_size=65536):
-                        if chunk:
-                            f_out.write(chunk)
-            paths[plate_id] = _funpack_mosaic_if_needed(local_path)
-        except requests.RequestException as exc:
-            LOG.warning("mosaic_package download failed for %s: %s", plate_id, exc)
-            continue
+    finally:
+        file_session.close()
     return paths
 
 

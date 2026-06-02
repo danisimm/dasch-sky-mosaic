@@ -7,13 +7,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import boto3
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
+from PIL import Image
 from wwt_data_formats.imageset import ImageSet as WwtImageSet
 
+from dasch_sky_mosaic.astrometry_solver import AstrometrySolveConfig, solve_image_wcs
 from dasch_sky_mosaic.fetch import Region, download_mosaic_paths, parse_cli_date_jd
-from dasch_sky_mosaic.plate_photos import PlatePhotoConfig, discover_and_download_plate_photos
+from dasch_sky_mosaic.fetch import StarglassClient
+from dasch_sky_mosaic.plate_photos import (
+    PlatePhotoConfig,
+    _choose_photo_entry,
+    _download_file,
+    _filename_from_url,
+    discover_and_download_plate_photos,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -34,6 +44,30 @@ class WtmlBuildConfig:
     session_root: Path
     photo_output_dir: Path
     overwrite: bool
+    s3_region: str = "us-east-1"
+
+
+@dataclass(frozen=True)
+class WtmlPlateSolveConfig:
+    plate_id: str
+    output_wtml: Path
+    output_json: Path
+    photo_output_dir: Path
+    astrometry_api_key: str
+    api_base: str
+    api_key: str | None
+    overwrite: bool
+    s3_region: str = "us-east-1"
+    astrometry_api_base: str = "https://nova.astrometry.net/api"
+    solver_work_dir: Path = Path("data/cache/dasch_session/astrometry")
+    solver_timeout_sec: float = 600.0
+    solver_upload_timeout_sec: float = 120.0
+    solver_poll_interval_sec: float = 5.0
+    ra_hint_deg: float | None = None
+    dec_hint_deg: float | None = None
+    radius_hint_deg: float | None = None
+    scale_low_arcsec_per_pix: float | None = None
+    scale_high_arcsec_per_pix: float | None = None
 
 
 def _require_region(config: WtmlBuildConfig) -> Region:
@@ -388,6 +422,136 @@ def _make_imageset_xml(
     return place
 
 
+def _generate_s3_presigned_url(plate_id: str, s3_region: str) -> str:
+    """Generate a presigned URL for a plate photo in S3.
+    
+    Bucket: dasch-prod-user
+    Key template: plates/{plate_id}/{plate_id}_pphoto_all.jpg
+    Expiry: 900 seconds (15 minutes)
+    """
+    s3_client = boto3.client("s3", region_name=s3_region)
+    bucket = "dasch-prod-user"
+    key = f"plates/{plate_id}/{plate_id}_pphoto_all.jpg"
+    
+    try:
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=900,  # 15 minutes
+        )
+        return url
+    except Exception as e:
+        LOG.warning(f"Failed to generate presigned URL for {plate_id}: {e}; falling back to S3 URL")
+        # Fallback: return a regular S3 URL (will fail at fetch time if credentials aren't available)
+        return f"https://{bucket}.s3.{s3_region}.amazonaws.com/{key}"
+
+
+def _download_plate_photo_for_plate_id(
+    plate_id: str,
+    output_dir: Path,
+    api_base: str,
+    api_key: str | None,
+    overwrite: bool,
+) -> tuple[Path, dict[str, Any]]:
+    client = StarglassClient(api_base=api_base, api_key=api_key)
+    payload = client.get_plate(plate_id)
+    chosen = _choose_photo_entry(payload)
+    if chosen is None or not chosen.get("url"):
+        raise RuntimeError(f"no full-plate non-thumbnail image available for plate {plate_id}")
+
+    photo_url = str(chosen["url"])
+    filename = _filename_from_url(photo_url, fallback_stem=f"{plate_id}_plate_all")
+    local_path = output_dir / filename
+    existed_before = local_path.exists()
+    n_bytes = _download_file(photo_url, local_path, overwrite=overwrite)
+
+    photo_meta = {
+        "plate_id": plate_id,
+        "status": "cached" if existed_before and not overwrite else "downloaded",
+        "portion": chosen.get("portion"),
+        "image_type": chosen.get("image_type"),
+        "thumbnail": bool(chosen.get("thumbnail", False)),
+        "local_photo_path": str(local_path),
+        "bytes": n_bytes,
+    }
+    return local_path, photo_meta
+
+
+def build_wtml_from_plate_solve(config: WtmlPlateSolveConfig) -> dict[str, Any]:
+    plate_id = config.plate_id.strip().lower()
+    if not plate_id:
+        raise ValueError("plate_id is required")
+
+    config.output_wtml.parent.mkdir(parents=True, exist_ok=True)
+    config.output_json.parent.mkdir(parents=True, exist_ok=True)
+    if (config.output_wtml.exists() or config.output_json.exists()) and not config.overwrite:
+        raise FileExistsError("refusing to overwrite output artifacts; rerun with --overwrite")
+
+    config.photo_output_dir.mkdir(parents=True, exist_ok=True)
+    photo_path, photo_meta = _download_plate_photo_for_plate_id(
+        plate_id=plate_id,
+        output_dir=config.photo_output_dir,
+        api_base=config.api_base,
+        api_key=config.api_key,
+        overwrite=config.overwrite,
+    )
+
+    solve_cfg = AstrometrySolveConfig(
+        api_key=config.astrometry_api_key,
+        api_base=config.astrometry_api_base,
+        working_dir=config.solver_work_dir,
+        timeout_seconds=config.solver_timeout_sec,
+        upload_timeout_seconds=config.solver_upload_timeout_sec,
+        poll_interval_seconds=config.solver_poll_interval_sec,
+        overwrite=config.overwrite,
+        ra_hint_deg=config.ra_hint_deg,
+        dec_hint_deg=config.dec_hint_deg,
+        radius_hint_deg=config.radius_hint_deg,
+        scale_low_arcsec_per_pix=config.scale_low_arcsec_per_pix,
+        scale_high_arcsec_per_pix=config.scale_high_arcsec_per_pix,
+    )
+    placement_header, solver_meta = solve_image_wcs(photo_path, plate_id=plate_id, config=solve_cfg)
+
+    with Image.open(photo_path) as img:
+        image_w, image_h = img.size
+
+    placement = _derive_skyimage_from_wcs(placement_header, image_w, image_h)
+    image_uri = _generate_s3_presigned_url(plate_id, config.s3_region)
+
+    root = ET.Element(
+        "Folder",
+        {
+            "Name": "DASCH Plate Solve WTML",
+            "Group": "Explorer",
+            "Type": "Sky",
+            "Searchable": "True",
+        },
+    )
+    root.append(
+        _make_imageset_xml(
+            plate_id=plate_id,
+            image_url=image_uri,
+            placement=placement,
+            image_width_px=image_w,
+            image_height_px=image_h,
+        )
+    )
+
+    xml_text = ET.tostring(root, encoding="unicode")
+    config.output_wtml.write_text("<?xml version='1.0' encoding='UTF-8'?>\n" + xml_text + "\n", encoding="utf-8")
+
+    result: dict[str, Any] = {
+        "workflow": "wtml-plate-solve",
+        "plate_id": plate_id,
+        "photo": photo_meta,
+        "solver": solver_meta,
+        "skyimage_placement": placement,
+        "output_wtml": str(config.output_wtml),
+    }
+    config.output_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
 def build_wtml(config: WtmlBuildConfig) -> dict[str, Any]:
     photos_manifest = _discover_or_load_photos(config)
     rows = [r for r in photos_manifest.get("photos", []) if r.get("status") in {"downloaded", "cached"}]
@@ -449,7 +613,7 @@ def build_wtml(config: WtmlBuildConfig) -> dict[str, Any]:
             fits_data=fits_data,
         )
         placement = _derive_skyimage_from_wcs(placement_header, image_w, image_h)
-        image_uri = image_path.resolve().as_uri()
+        image_uri = _generate_s3_presigned_url(plate_id, config.s3_region)
         center_ra_deg = float(wcs.wcs.crval[0])
         center_dec_deg = float(wcs.wcs.crval[1])
 

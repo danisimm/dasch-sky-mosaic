@@ -302,6 +302,9 @@ def _query_point_key(ra_deg: float, dec_deg: float) -> tuple[int, int]:
 def _grid_axis(half_width_deg: float, spacing_deg: float) -> list[float]:
     if half_width_deg == 0:
         return [0.0]
+    # If spacing spans the full axis width, query only the center point.
+    if spacing_deg >= (2.0 * half_width_deg):
+        return [0.0]
     n_steps = max(1, math.ceil((2.0 * half_width_deg) / spacing_deg))
     axis = np.linspace(-half_width_deg, half_width_deg, num=n_steps + 1)
     return [float(v) for v in axis]

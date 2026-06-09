@@ -156,6 +156,53 @@ Notes:
 - This is a first-pass WTML path focused on proving photo+WCS integration.
 - Mosaicing and advanced guardrails are intentionally deferred.
 
+## Plate ID -> WTML via Astrometry.net (No Mosaicing)
+
+Use `wtml-solve-plate` to build WTML for a single DASCH plate by:
+
+- Fetching the full-plate photo for a supplied `plate_id`.
+- Uploading that photo to the astrometry.net web API for solving.
+- Deriving SkyImage placement directly from the solved WCS.
+
+This command is WTML-placement focused and does not use the mosaicing pipeline.
+
+Example:
+
+```powershell
+python -m dasch_sky_mosaic wtml-solve-plate `
+  --plate-id dnb06613 `
+  --astrometry-api-key "YOUR_ASTROMETRY_NET_KEY" `
+  --output-wtml data/output/dnb06613_solve.wtml `
+  --output-json data/output/dnb06613_solve_report.json `
+  --overwrite
+```
+
+Or set an environment variable (default name `ASTROMETRY_NET_API_KEY`) and omit the key argument:
+
+```powershell
+$env:ASTROMETRY_NET_API_KEY = "YOUR_ASTROMETRY_NET_KEY"
+python -m dasch_sky_mosaic wtml-solve-plate --plate-id dnb06613 --overwrite
+```
+
+Optional solve hints can improve speed and robustness:
+
+```powershell
+python -m dasch_sky_mosaic wtml-solve-plate `
+  --plate-id dnb06613 `
+  --ra-hint-deg 279.23473 `
+  --dec-hint-deg 38.78368 `
+  --radius-hint-deg 8 `
+  --scale-low-arcsec-per-pix 3 `
+  --scale-high-arcsec-per-pix 15 `
+  --overwrite
+```
+
+Notes:
+
+- Requires a valid astrometry.net API key.
+- The command writes astrometry artifacts (WCS file and submission metadata) under `data/cache/dasch_session/astrometry` by default.
+- Existing WTML discovery and manifest-first workflows are unchanged.
+
 ## Plate ID -> WWT Launch URL (No Discovery, No Local FITS/JPG Files)
 
 Use `wwt-link` when you already have a `plate_id` and want a direct

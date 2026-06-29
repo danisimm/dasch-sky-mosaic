@@ -2,27 +2,52 @@
 
 DASCH files live in the `dasch-prod-user` bucket. This module provides
 functions to download them directly from S3, bypassing the Starglass API.
-This is cheaper (fewer API calls) and useful for batch processing.
+Advantages over call_sg: no Starglass rate limiting, and no reliance on
+presigned URLs (which expire ~15 minutes after the API call).
 
-Known S3 key structure (from mosaic_package API response):
-  Photo (JPG):  plates/{plate_id}/{plate_id}_pphoto_all.jpg
-  FITS mosaic:  plates/{plate_id}/{plate_id}_mosaic_{mosnum:02d}_16ww.fit.fz
-
-  Always uses binning=16 (the binning=1 files are too large).
-  Use download_fits_via_sg() in call_sg if you need the exact presigned URL from the API.
+Always uses binning=16 (the binning=1 files are too large).
 """
 from __future__ import annotations
 
+import csv
 import logging
 from pathlib import Path
+from typing import Any
 
-from dasch_sky_mosaic.utils import _download_stream
+import boto3
+
+from dasch_sky_mosaic.utils import _decompress_fz, _unpacked_path
 
 LOG = logging.getLogger(__name__)
 
 S3_BUCKET = "dasch-prod-user"
 S3_REGION = "us-east-1"
-S3_BASE_URL = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com"
+
+_CREDS_CSV = Path(__file__).parents[2] / "credentials" / "danisimm_plates_accessKeys.csv"
+
+_s3_client: Any = None
+
+
+def _get_s3_client() -> Any:
+    global _s3_client
+    if _s3_client is None:
+        with open(_CREDS_CSV, newline="", encoding="utf-8-sig") as f:
+            row = next(csv.DictReader(f))
+        _s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=row["Access key ID"],
+            aws_secret_access_key=row["Secret access key"],
+            region_name=S3_REGION,
+        )
+    return _s3_client
+
+
+def _s3_download(key: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    response = _get_s3_client().get_object(Bucket=S3_BUCKET, Key=key)
+    with dest.open("wb") as f:
+        for chunk in response["Body"].iter_chunks(chunk_size=65536):
+            f.write(chunk)
 
 
 def download_photo_from_s3(
@@ -30,20 +55,16 @@ def download_photo_from_s3(
     dest_dir: Path,
     overwrite: bool = False,
 ) -> Path:
-    """Download a plate JPG directly from S3.
-
-    The file is cached at dest_dir/{plate_id}_pphoto_all.jpg.
-    """
+    """Download a plate JPG directly from S3."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{plate_id}_pphoto_all.jpg"
 
     if dest.exists() and not overwrite:
-        LOG.info("Reusing cached photo for %s: %s", plate_id, dest.name)
+        LOG.info("Reusing cached photo for %s", plate_id)
         return dest
 
-    url = f"{S3_BASE_URL}/plates/{plate_id}/{plate_id}_pphoto_all.jpg"
     LOG.info("Downloading photo for %s from S3", plate_id)
-    _download_stream(url, dest)
+    _s3_download(f"plates/{plate_id}/{plate_id}_pphoto_all.jpg", dest)
     return dest
 
 
@@ -54,26 +75,28 @@ def download_fits_from_s3(
 ) -> Path:
     """Download a binning=16 FITS mosaic directly from S3 and decompress to .fits.
 
-    Tries mosnum=0 then mosnum=1 since the correct value varies per plate.
-    Use download_fits_via_sg() if you need the guaranteed-correct key from the API.
+    Lists objects under the plate prefix and matches with a regex to find the
+    correct key regardless of rotation/flag suffixes (e.g. _16r270ww, _16ww).
     """
-    from dasch_sky_mosaic.call_sg import _decompress_fz, _unpacked_path
-
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    for mosnum in (0, 1):
-        filename = f"{plate_id}_mosaic_{mosnum:02d}_16ww.fit.fz"
-        dest_fz = dest_dir / filename
-        dest_fits = _unpacked_path(dest_fz)
-        if dest_fits.exists() and not overwrite:
-            LOG.info("Reusing cached FITS for %s: %s", plate_id, dest_fits.name)
-            return dest_fits
-        url = f"{S3_BASE_URL}/plates/{plate_id}/{filename}"
-        try:
-            LOG.info("Downloading FITS for %s from S3 (mosnum=%d)", plate_id, mosnum)
-            _download_stream(url, dest_fz)
-            return _decompress_fz(dest_fz)
-        except Exception:
-            if mosnum == 1:
-                raise
-            LOG.debug("mosnum=0 not found for %s, trying mosnum=1", plate_id)
+    prefix = f"plates/{plate_id}/{plate_id}_mosaic_"
+    resp = _get_s3_client().list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+    keys = [obj["Key"] for obj in resp.get("Contents", [])]
+    matching = [k for k in keys if k.endswith("ww.fit.fz")]
+
+    if not matching:
+        raise FileNotFoundError(f"no binning=16 FITS mosaic found for {plate_id} in S3")
+
+    key = matching[0]
+    filename = key.split("/")[-1]
+    dest_fz = dest_dir / filename
+    dest_fits = _unpacked_path(dest_fz)
+
+    if dest_fits.exists() and not overwrite:
+        LOG.info("Reusing cached FITS for %s: %s", plate_id, dest_fits.name)
+        return dest_fits
+
+    LOG.info("Downloading FITS for %s from S3: %s", plate_id, filename)
+    _s3_download(key, dest_fz)
+    return _decompress_fz(dest_fz)

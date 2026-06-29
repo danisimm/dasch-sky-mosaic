@@ -1,4 +1,11 @@
-# This file was generated with the assistance of GitHub Copilot (AI).
+"""Per-plate background estimation and global background matching.
+
+Implements the Montage-style additive background matching algorithm:
+  1. Fit a 2D polynomial background to each plate (per-plate).
+  2. Solve for additive per-plate corrections using pairwise overlap residuals.
+  3. Optionally refine on overlap seams using a vignette template.
+  4. Optionally fit and apply a low-order residual surface per plate.
+"""
 from __future__ import annotations
 
 import logging
@@ -13,19 +20,13 @@ _MAD_TO_STDDEV = 1.4826
 
 
 def _robust_clip(arr: np.ndarray, lo_pct: float = 5.0, hi_pct: float = 95.0) -> np.ndarray:
-    """Return a boolean mask selecting values within [lo_pct, hi_pct] percentile range."""
     lo, hi = np.nanpercentile(arr, [lo_pct, hi_pct])
     return (arr >= lo) & (arr <= hi)
 
 
 def _plate_interior_mask(image: np.ndarray, binning: int) -> np.ndarray:
-    """Build support mask using geometric trimming of raw mosaic edges.
-
-    We keep all finite data values and remove 5% from each edge of the raw
-    plate mosaic (as requested) to avoid boundary artefacts.
-    """
+    """Build support mask: keep finite pixels, trim 5% from each edge, lightly erode."""
     support = np.isfinite(image)
-
     ny, nx = image.shape
     trim_y = max(1, int(round(_EDGE_TRIM_FRACTION * ny)))
     trim_x = max(1, int(round(_EDGE_TRIM_FRACTION * nx)))
@@ -33,26 +34,15 @@ def _plate_interior_mask(image: np.ndarray, binning: int) -> np.ndarray:
     support[-trim_y:, :] = False
     support[:, :trim_x] = False
     support[:, -trim_x:] = False
-
-    # A light erosion avoids one-pixel edge interpolation artefacts.
     erosion_iters = max(1, int(round(6.0 / max(1, binning))))
     return binary_erosion(support, iterations=erosion_iters)
 
 
 def _fit_plate_background(image: np.ndarray, degree: int = 2) -> np.ndarray:
-    """Fit and return a smooth 2D polynomial background model for a plate.
+    """Fit a smooth 2D polynomial background using low-percentile block sampling.
 
-    Samples the plate on a coarse grid using the 20th-percentile of each block
-    so that point sources (stars) are excluded and only the diffuse background
-    is modelled.  The resulting surface captures both the large-scale sky
-    background and radially symmetric vignetting (bright centre -> dark corners
-    in photographic plates), which is a degree-2 radial polynomial.
-
-    This is analogous to the per-image background modelling step in the IPAC
-    Montage pipeline (mBackground), which must precede global offset matching so
-    that spatially varying illumination does not bias the pairwise statistics.
-
-    Returns an array of the same shape as `image`, dtype float32.
+    Analogous to mBackground in the IPAC Montage pipeline. Returns a float32
+    array of the same shape as `image`.
     """
     ny, nx = image.shape
     stride = max(4, min(ny, nx) // 40)
@@ -64,14 +54,11 @@ def _fit_plate_background(image: np.ndarray, degree: int = 2) -> np.ndarray:
 
     for y in range(half, ny, stride):
         for x in range(half, nx, stride):
-            y0, y1 = max(0, y - half), min(ny, y + half)
-            x0, x1 = max(0, x - half), min(nx, x + half)
-            block = image[y0:y1, x0:x1]
+            block = image[max(0, y - half):min(ny, y + half), max(0, x - half):min(nx, x + half)]
             finite = block[np.isfinite(block)]
             if len(finite) < 4:
                 continue
-            # Low percentile -> background, not stellar peaks.
-            sample_y.append(y / ny - 0.5)   # centred on 0 for numerical stability
+            sample_y.append(y / ny - 0.5)
             sample_x.append(x / nx - 0.5)
             sample_v.append(float(np.percentile(finite, 20)))
 
@@ -83,7 +70,6 @@ def _fit_plate_background(image: np.ndarray, degree: int = 2) -> np.ndarray:
     sx = np.array(sample_x)
     sv = np.array(sample_v, dtype=np.float64)
 
-    # Sigma-clip blocks that are dominated by emission (bright galaxies, etc.).
     med = np.median(sv)
     mad = np.median(np.abs(sv - med)) * _MAD_TO_STDDEV + 1e-6
     keep = np.abs(sv - med) <= 5.0 * mad
@@ -106,8 +92,7 @@ def _fit_plate_background(image: np.ndarray, degree: int = 2) -> np.ndarray:
     Y, X = np.mgrid[0:ny, 0:nx]
     Yn = (Y / ny - 0.5).ravel().astype(np.float64)
     Xn = (X / nx - 0.5).ravel().astype(np.float64)
-    bg = (_design(Yn, Xn) @ coeffs).reshape(ny, nx).astype(np.float32)
-    return bg
+    return (_design(Yn, Xn) @ coeffs).reshape(ny, nx).astype(np.float32)
 
 
 def _solve_global_bg_offsets(
@@ -115,25 +100,10 @@ def _solve_global_bg_offsets(
     good_masks: list[np.ndarray],
     plate_names: list[str],
 ) -> list[float]:
-    """Solve for per-plate additive background corrections to eliminate seam lines.
+    """Solve per-plate additive corrections by pairwise overlap least-squares.
 
-    Implements the global background-matching algorithm used by IPAC Montage
-    (Berriman et al. 2003) and conceptually related to SDSS ubercalibration
-    (Padmanabhan et al. 2008).
-
-    Rather than matching each plate sequentially against the accumulated mosaic
-    (which drifts with plate order), this collects all pairwise overlap
-    measurements simultaneously and solves the overdetermined linear system
-
-        a_i - a_j = d_ij   for all overlapping pairs (i, j)
-
-    by least squares, where d_ij is the robust median of (plate_i - plate_j)
-    in the shared footprint.  The most-recently observed plate (last in sorted
-    order) is anchored at a = 0, so its background level becomes the
-    photometric reference for the whole mosaic.
-
-    Returns a list of additive offsets; add offset[i] to plate i before
-    compositing.
+    Implements the Montage / SDSS ubercalibration algorithm. The most-recently
+    observed plate (last in sorted order) is anchored at offset 0.
     """
     N = len(reprojected_plates)
     if N <= 1:
@@ -145,10 +115,8 @@ def _solve_global_bg_offsets(
     for i in range(N):
         for j in range(i + 1, N):
             overlap = good_masks[i] & good_masks[j]
-            n_overlap = int(np.count_nonzero(overlap))
-            if n_overlap < 300:
+            if int(np.count_nonzero(overlap)) < 300:
                 continue
-
             diff = (
                 reprojected_plates[i][overlap].astype(np.float64)
                 - reprojected_plates[j][overlap].astype(np.float64)
@@ -156,7 +124,6 @@ def _solve_global_bg_offsets(
             core = diff[_robust_clip(diff)]
             if len(core) < 50:
                 continue
-
             d_ij = float(np.median(core))
             row = np.zeros(N, dtype=np.float64)
             row[i] = 1.0
@@ -164,21 +131,14 @@ def _solve_global_bg_offsets(
             constraint_rows.append(row)
             constraint_rhs.append(d_ij)
             LOG.info(
-                "Overlap constraint (%s, %s): n_pixels=%d delta=%.2f",
-                plate_names[i],
-                plate_names[j],
-                n_overlap,
-                d_ij,
+                "Overlap constraint (%s, %s): n=%d delta=%.2f",
+                plate_names[i], plate_names[j], int(np.count_nonzero(overlap)), d_ij,
             )
 
     if not constraint_rows:
-        LOG.warning(
-            "No overlapping plate pairs with sufficient coverage; "
-            "global background matching has no effect."
-        )
+        LOG.warning("No overlapping pairs with sufficient coverage; background matching has no effect.")
         return [0.0] * N
 
-    # Anchor the most-recently observed plate (last in date-sorted list).
     anchor = np.zeros(N, dtype=np.float64)
     anchor[N - 1] = 1.0
     constraint_rows.append(anchor)
@@ -189,7 +149,7 @@ def _solve_global_bg_offsets(
     offsets_raw, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
     offsets = [float(x) for x in offsets_raw]
     LOG.info(
-        "Global background offsets (reference=%s): %s",
+        "Global background offsets (ref=%s): %s",
         plate_names[N - 1],
         "  ".join(f"{plate_names[i]}={offsets[i]:+.2f}" for i in range(N)),
     )
@@ -202,24 +162,19 @@ def _estimate_overlap_template_refinement(
     template: np.ndarray,
     overlap: np.ndarray,
 ) -> tuple[float, float, bool]:
-    """Estimate seam-focused correction: candidate += gain*template + offset.
-
-    This uses only overlap pixels, so the adjustment is driven by agreement
-    where plates actually meet (not by interior brightness structure).
-    """
+    """Fit candidate += gain*template + offset using overlap pixels only."""
     n_overlap = int(np.count_nonzero(overlap))
     if n_overlap < 500:
         return 0.0, 0.0, False
 
     y = (reference[overlap] - candidate[overlap]).astype(np.float64)
     t = template[overlap].astype(np.float64)
-
     keep = _robust_clip(y) & _robust_clip(t)
     if int(np.count_nonzero(keep)) < 300:
         return 0.0, 0.0, False
+
     y_fit = y[keep]
     t_fit = t[keep]
-
     if np.nanstd(t_fit) < 1e-3:
         return 0.0, float(np.nanmedian(y_fit)), True
 
@@ -229,7 +184,6 @@ def _estimate_overlap_template_refinement(
     except Exception:
         return 0.0, 0.0, False
 
-    # Constrain to plausible corrections; reject unstable fits.
     if not np.isfinite(gain) or abs(gain) > 0.6:
         return 0.0, 0.0, False
     if not np.isfinite(offset) or abs(offset) > 1500:
@@ -244,8 +198,7 @@ def _fit_overlap_residual_surface(
     degree: int = 1,
 ) -> np.ndarray | None:
     """Fit a low-order polynomial residual surface on overlap pixels."""
-    n_overlap = int(np.count_nonzero(overlap))
-    if n_overlap < 500:
+    if int(np.count_nonzero(overlap)) < 500:
         return None
 
     y_idx, x_idx = np.where(overlap)
@@ -257,7 +210,6 @@ def _fit_overlap_residual_surface(
     y = y_idx[keep].astype(np.float64)
     x = x_idx[keep].astype(np.float64)
     d = delta[keep]
-
     ny, nx = reference.shape
     yn = y / max(1.0, float(ny - 1)) - 0.5
     xn = x / max(1.0, float(nx - 1)) - 0.5
@@ -273,10 +225,7 @@ def _fit_overlap_residual_surface(
         coeffs, _, _, _ = np.linalg.lstsq(X, d, rcond=None)
     except Exception:
         return None
-    if not np.all(np.isfinite(coeffs)):
-        return None
-
-    if np.max(np.abs(coeffs)) > 2000.0:
+    if not np.all(np.isfinite(coeffs)) or np.max(np.abs(coeffs)) > 2000.0:
         return None
     return coeffs.astype(np.float64)
 
@@ -287,16 +236,11 @@ def _evaluate_residual_surface(shape: tuple[int, int], coeffs: np.ndarray, degre
     y, x = np.mgrid[0:ny, 0:nx]
     yn = y.astype(np.float64) / max(1.0, float(ny - 1)) - 0.5
     xn = x.astype(np.float64) / max(1.0, float(nx - 1)) - 0.5
-
     if degree == 1:
         out = coeffs[0] + coeffs[1] * yn + coeffs[2] * xn
     else:
         out = (
-            coeffs[0]
-            + coeffs[1] * yn
-            + coeffs[2] * xn
-            + coeffs[3] * yn * yn
-            + coeffs[4] * yn * xn
-            + coeffs[5] * xn * xn
+            coeffs[0] + coeffs[1] * yn + coeffs[2] * xn
+            + coeffs[3] * yn * yn + coeffs[4] * yn * xn + coeffs[5] * xn * xn
         )
     return out.astype(np.float32)

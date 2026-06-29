@@ -1,5 +1,3 @@
-"""Utilities for building DASCH sky mosaics."""
-
-__all__ = ["__version__"]
+"""DASCH sky mosaic tools."""
 
 __version__ = "0.1.0"

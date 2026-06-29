@@ -1,287 +1,126 @@
-# DASCH Sky Mosaic Builder
+# dasch-sky-mosaic
 
-This workspace builds WCS-preserving sky mosaics from DASCH full-plate images.
-It uses DASCH/Starglass APIs to discover candidate plates and downloads per-plate FITS files directly from the Starglass `mosaic_package` endpoint.
-
-## What the pipeline does
-
-- Queries the DASCH exposure catalog over a user-defined sky region by sampling a grid of sky positions.
-- Uses only `queryexps` response fields (`obsDate`, `solnum`, `wcssource`) to pick candidates, avoiding extra per-plate metadata calls.
-- At each sampled sky position, selects the single most recent eligible plate.
-- Downloads DASCH mosaics through direct `POST /dasch/dr7/mosaic_package` base FITS requests.
-- Reprojects each selected plate onto a user-defined output WCS.
-- Stitches with a last-write-wins strategy (oldest to newest), so each output pixel reflects the most recent plate covering that point.
-- Writes a JSON manifest describing the selected inputs and observation dates.
-
-## Important scientific limitations
-
-- DASCH exposure discovery is point-based. For an extended region, this project queries a configurable grid and unions the per-point winners. Smaller grid spacing improves completeness at the cost of more API calls.
-- By default, only plates with exactly one astrometric solution are included. This avoids misprojecting multi-exposure plates, where one plate image can contain multiple distinct sky solutions.
-- The default combination mode is "most recent wins" after optional per-plate median background subtraction. This is suitable for visualization and chronology tracking, not precision photometry.
-- The output FITS keeps accurate WCS in the target projection, but this project does not yet generate WWT TOAST tile pyramids. The output mosaic is intended to be the scientifically valid intermediate product for later tiling.
+Personal research tools for working with DASCH photographic plate data.
+Two distinct workflows: a WCS batch pipeline for generating WTML placement data,
+and an all-sky mosaic pipeline for stitching plates into large FITS images.
 
 ## Installation
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e .
+pip install -e .
 ```
 
-If you have a Starglass API key, set it to raise API rate limits:
+If you have a Starglass API key, set it to use the authenticated (higher rate-limit) API:
 
 ```powershell
-$env:DASCHLAB_API_KEY = "your-api-key"
+$env:STARGLASS_API_KEY = "your-api-key"
 ```
 
-Alternatively, place the key in a `.env` file at the project root (gitignored):
+Or place it in a `.env` file at the project root (gitignored):
 
 ```
-DASCHLAB_API_KEY=your-api-key
+STARGLASS_API_KEY=your-api-key
 ```
 
-The CLI loads `.env` automatically on startup. Without an API key the code uses the public (rate-limited) API.
+Credentials and API key files live in `credentials/` (gitignored).
 
-## Example
+---
 
-This example builds a 6-by-6 degree TAN-projected mosaic around M31 using all eligible plates from 1910 up to 1930, with an epoch map:
+## Workflow 1: WCS batch solve
+
+Given a list of plate IDs, download the plate JPG (and FITS for the astroalign solver),
+solve WCS for each JPG, and write per-plate JSON containing placement data for WTML
+generation. Intended to run at scale across 400k+ plates.
 
 ```powershell
-python -m dasch_sky_mosaic build `
-  --ra-deg 10.6847083 `
-  --dec-deg 41.26875 `
-  --width-deg 6 `
-  --height-deg 6 `
-  --earliest-date 1910-01-01 `
-  --as-of-date 1930-12-31 `
-  --pixel-scale-arcsec 60 `
-  --output-fits data/output/m31_1910_1930.fits `
-  --epoch-fits data/output/m31_1910_1930_epoch.fits `
-  --delete-base-mosaics `
-  --manifest-json data/output/m31_1910_1930_manifest.json
+python -m dasch_sky_mosaic.wcs_solve a11740 br00130 `
+    --download-method s3 `
+    --solver astroalign `
+    --output-dir data/output/wcs
 ```
 
-## Key options
+### Key options
 
-- `--binning {1,16}`: DASCH mosaic binning level. `16` is dramatically smaller and should be the default for large-area work.
-- `--query-step-deg`: spacing of the discovery grid used to find plates intersecting the requested sky region.
-- The build workflow always downloads `base_fits_url` directly from Starglass `mosaic_package`.
-- When a `.fit.fz` file is returned, the workflow automatically funpacks it to an uncompressed `.fits` file (using `funpack` if available, otherwise an Astropy fallback).
-- `--projection {TAN,CAR}`: output FITS projection.
-- `--as-of-date` and `--earliest-date`: optional date bounds for candidate exposures. Omit both to build the newest-available mosaic.
-- `--allow-multi-solution-plates`: include plates with multiple WCS solutions. This can produce incorrect reprojections and is disabled by default.
-- `--preserve-native-background`: skip median background subtraction before coaddition.
-- `--delete-base-mosaics`: remove cached base mosaics after build to free disk space.
+- `--solver {astroalign,scamp}`: WCS solver backend.
+  - `astroalign` (default): aligns the JPG to the FITS mosaic via star pattern matching.
+    Requires downloading both a JPG and a FITS per plate.
+  - `scamp`: SExtractor + SCAMP solve from the JPG only. **Not yet implemented (stub).**
+- `--download-method {s3,sg}`: how to fetch plate JPGs.
+  - `s3` (default): direct S3 download, faster and cheaper.
+  - `sg`: Starglass API.
+- `--photo-dir`: cache directory for downloaded JPGs (default: `data/cache/photos`).
+- `--fits-dir`: cache directory for downloaded FITS (default: `data/cache/mosaic_package`).
+- `--output-dir`: directory for output JSON files (default: `data/output/wcs`).
+- `--binning {1,16}`: DASCH mosaic binning level (default: `16`).
+- `--overwrite`: re-download and re-solve even if cached.
+- `--api-key`: Starglass API key (or set `STARGLASS_API_KEY` env var).
 
-Current implementation note:
-- FITS mode is fully supported.
+### Output
 
-## Output products
+Each plate produces a JSON file `{plate_id}_wcs.json` containing:
+- `wcs_header`: FITS WCS keywords for the plate JPG
+- `placement`: WWT SkyImage fields (`center_x/y`, `rotation_deg`, `base_degrees_per_tile`, etc.)
+- `image_width_px`, `image_height_px`
+- `alignment_meta`: solver diagnostics (backend, matches, parity, etc.)
 
-- Main mosaic FITS with the requested output WCS.
-- Optional epoch FITS (`--epoch-fits`) with per-pixel Julian Date values for the winning plate.
-- JSON manifest recording selected plates, most-recent observation dates, and local cache paths.
+WTML generation from this data is handled server-side by an AWS Lambda function.
 
-## Plate-photo JPG discovery and download
+---
 
-If you want source plate photographs (JPG) for WTML texture work, use the
-`plate-photos` command. This command:
+## Workflow 2: All-sky mosaic
 
-- Reuses the same discovery logic as FITS builds (`queryexps` sampling + date filters).
-- Selects candidate plate IDs for your region.
-- Calls Starglass plate metadata (`GET /plates/p/{plate_id}`) and downloads the
-  full-plate (`portion=all`) non-thumbnail image only.
-- Writes a JSON manifest with local paths and status.
-
-Example:
+Discover plates covering a sky region and time range, download their FITS mosaics,
+reproject onto a common WCS, and stitch into a single output FITS.
 
 ```powershell
-python -m dasch_sky_mosaic plate-photos `
-  --ra-deg 10.6847083 `
-  --dec-deg 41.26875 `
-  --width-deg 6 `
-  --height-deg 6 `
-  --as-of-date 1930-12-31 `
-  --earliest-date 1910-01-01 `
-  --query-step-deg 5 `
-  --output-dir data/cache/dasch_session/plate_photos `
-  --manifest-json data/output/m31_plate_photos_manifest.json
+python -m dasch_sky_mosaic.mosaic.build_mosaic `
+    --ra 83.8 --dec -5.4 `
+    --width 2.0 `
+    --as-of-date 1950-01-01 `
+    --output data/output/orion_1950.fits
 ```
 
-Useful options:
+### Key options
 
-- `--max-plates N`: cap the number of discovered plates.
-- `--allow-multi-solution-plates`: keep plates with multiple WCS solutions.
-- `--overwrite`: replace existing local photo files and manifest.
+- `--ra`, `--dec`: region center (degrees, required).
+- `--width`, `--height`: region size in degrees (height defaults to width).
+- `--as-of-date`, `--earliest-date`: ISO or JD date bounds for candidate plates.
+- `--output`: output FITS mosaic path (required).
+- `--epoch-fits`: optional output for per-pixel Julian Date values.
+- `--manifest`: output manifest JSON (defaults to `{output stem}_manifest.json`).
+- `--session-dir`: cache directory for downloaded files (default: `data/cache/dasch_session`).
+- `--pixel-scale`: output pixel scale in arcsec/pixel (defaults to native plate scale).
+- `--projection {TAN,CAR}`: WCS projection (default: `TAN`).
+- `--binning {1,16}`: DASCH mosaic binning level (default: `16`; much smaller downloads).
+- `--query-step`: grid spacing for plate discovery in degrees (default: `0.5`).
+- `--max-plates`: cap the number of plates used.
+- `--allow-multi-solution`: include plates with multiple WCS solutions (off by default).
+- `--subtract-background`: apply per-plate background subtraction and global matching.
+- `--overwrite`: overwrite existing output files.
+- `--api-key`: Starglass API key (or set `STARGLASS_API_KEY` env var).
 
-## Photo+WCS -> WTML
+### Output
 
-Use `wtml` to generate WTML from full plate JPGs paired with
-WCS authority from DASCH value-added FITS mosaics.
+- Main mosaic FITS with the requested WCS.
+- Optional epoch FITS with per-pixel Julian Date of the winning plate.
+- JSON manifest recording selected plates and local cache paths.
 
-This command supports two modes:
+---
 
-- Discovery-first: no input photo manifest required; plate IDs are discovered from a sky region.
-- Manifest-first: reuse an existing `plate-photos` manifest.
+## Module structure
 
-Discovery-first example:
-
-```powershell
-python -m dasch_sky_mosaic wtml `
-  --ra-deg 279.23473479 `
-  --dec-deg 38.78368896 `
-  --width-deg 1 `
-  --height-deg 1 `
-  --query-step-deg 1 `
-  --max-plates 1 `
-  --output-wtml data/output/vega_wtml.wtml `
-  --output-json data/output/vega_wtml_report.json `
-  --overwrite
 ```
-
-Manifest-first example:
-
-```powershell
-python -m dasch_sky_mosaic wtml `
-  --photo-manifest-json data/output/vega_plate_photos_manifest.json `
-  --output-wtml data/output/vega_wtml.wtml `
-  --output-json data/output/vega_wtml_report.json `
-  --overwrite
+src/dasch_sky_mosaic/
+  call_sg.py         # Starglass API client; JPG and FITS download via API
+  call_s3.py         # Direct S3 downloads (JPG working; FITS stub pending key structure)
+  wcs_solve.py       # Astroalign WCS solver; runnable batch script
+  wtml_gen.py        # Pure WTML XML generation from WCS placement dicts
+  mosaic/
+    discover.py      # Region/BuildConfig dataclasses; plate grid discovery via queryexps
+    background.py    # Montage-style global background matching
+    plate_photos.py  # Region-based plate photo (JPG) discovery and download
+    stitch.py        # Reprojection and coaddition pipeline
+    build_mosaic.py  # Runnable mosaic builder
 ```
-
-Notes:
-
-- Source JPG files are not modified.
-- This is a first-pass WTML path focused on proving photo+WCS integration.
-- Mosaicing and advanced guardrails are intentionally deferred.
-
-## Plate ID -> WTML via Astrometry.net (No Mosaicing)
-
-Use `wtml-solve-plate` to build WTML for a single DASCH plate by:
-
-- Fetching the full-plate photo for a supplied `plate_id`.
-- Uploading that photo to the astrometry.net web API for solving.
-- Deriving SkyImage placement directly from the solved WCS.
-
-This command is WTML-placement focused and does not use the mosaicing pipeline.
-
-Example:
-
-```powershell
-python -m dasch_sky_mosaic wtml-solve-plate `
-  --plate-id dnb06613 `
-  --astrometry-api-key "YOUR_ASTROMETRY_NET_KEY" `
-  --output-wtml data/output/dnb06613_solve.wtml `
-  --output-json data/output/dnb06613_solve_report.json `
-  --overwrite
-```
-
-Or set an environment variable (default name `ASTROMETRY_NET_API_KEY`) and omit the key argument:
-
-```powershell
-$env:ASTROMETRY_NET_API_KEY = "YOUR_ASTROMETRY_NET_KEY"
-python -m dasch_sky_mosaic wtml-solve-plate --plate-id dnb06613 --overwrite
-```
-
-Optional solve hints can improve speed and robustness:
-
-```powershell
-python -m dasch_sky_mosaic wtml-solve-plate `
-  --plate-id dnb06613 `
-  --ra-hint-deg 279.23473 `
-  --dec-hint-deg 38.78368 `
-  --radius-hint-deg 8 `
-  --scale-low-arcsec-per-pix 3 `
-  --scale-high-arcsec-per-pix 15 `
-  --overwrite
-```
-
-Notes:
-
-- Requires a valid astrometry.net API key.
-- The command writes astrometry artifacts (WCS file and submission metadata) under `data/cache/dasch_session/astrometry` by default.
-- Existing WTML discovery and manifest-first workflows are unchanged.
-
-## Plate ID -> WWT Launch URL (No Discovery, No Local FITS/JPG Files)
-
-Use `wwt-link` when you already have a `plate_id` and want a direct
-Worldwide Telescope launch URL generated in one step.
-
-This command:
-
-- Skips discovery entirely (plate ID is the only required scientific input).
-- Fetches plate-photo and mosaic-package metadata directly for the given plate.
-- Streams photo and FITS data in memory for alignment/WCS placement derivation.
-- Generates a ShowImage-style URL and wraps it in a WWT webclient launch URL.
-- Allows overriding the WWT-facing image URL so links can point to a display/proxy endpoint instead of a signed download URL.
-
-Example:
-
-```powershell
-python -m dasch_sky_mosaic wwt-link `
-  --plate-id dnb06613 `
-  --output-json data/output/dnb06613_wwt_link.json `
-  --overwrite
-```
-
-If your signed source URL behaves like a download-only link for WWT rendering,
-provide a WWT-facing URL directly:
-
-```powershell
-python -m dasch_sky_mosaic wwt-link `
-  --plate-id dnb06613 `
-  --wwt-image-url "https://your-site.example/wwt/plate-image/dnb06613.jpg" `
-  --output-json data/output/dnb06613_wwt_link.json `
-  --overwrite
-```
-
-Or use a template:
-
-```powershell
-python -m dasch_sky_mosaic wwt-link `
-  --plate-id dnb06613 `
-  --wwt-image-url-template "https://your-site.example/wwt/plate-image/{plate_id}.jpg" `
-  --output-json data/output/dnb06613_wwt_link.json `
-  --overwrite
-```
-
-Notes:
-
-- The source image URLs are short-lived (about 15 minutes).
-- The command never writes intermediate FITS/JPG alignment artifacts to disk.
-- `--output-json` is optional; if omitted, the launch URL is logged only.
-- `image_url` in output JSON is the fetched source URL; `wwt_image_url` is the URL actually embedded in WWT links.
-
-## In-Memory WWT Image Proxy (No Local Storage)
-
-If WWT does not render the presigned Starglass image URL directly, run the built-in
-proxy server. It fetches temporary Starglass image links in memory and re-serves
-them with display-friendly headers.
-
-Start the proxy:
-
-```powershell
-python -m dasch_sky_mosaic wwt-proxy --host 127.0.0.1 --port 8765
-```
-
-Endpoints:
-
-- `GET /wwt/plate-image/{plate_id}.jpg`
-  - Proxies the current full-plate image for `plate_id`
-  - No disk writes; response is streamed from memory
-- `GET /wwt/link?plate_id={plate_id}`
-  - Generates a launch-link JSON payload using the proxy image endpoint as `wwt_image_url`
-
-Example link generation via proxy endpoint:
-
-```text
-http://127.0.0.1:8765/wwt/link?plate_id=dnb06613
-```
-
-For production deployment, implement this endpoint in your website backend over HTTPS
-and use that URL as the `imageurl` in WWT links.
-
-## Next step for Worldwide Telescope
-
-Once the stitched FITS looks right, convert it into a TOAST tile pyramid using a WWT-compatible tiler such as `toasty` or `wwt_data_formats`. This script is focused on the plate-selection, download, reprojection, and coaddition stage where WCS integrity matters most.

@@ -41,7 +41,7 @@ class Region:
 @dataclass(frozen=True)
 class CandidatePlate:
     plate_id: str
-    obs_date_jd: float
+    exp_date_jd: float
     n_wcs_solutions: int
     n_exposures: int
     preferred_solution_num: int | None
@@ -148,7 +148,7 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
         for hit in hits:
             if not hit.has_imaging:
                 continue
-            obs_jd = hit.obs_date_jd
+            obs_jd = hit.exp_date_jd
             if obs_jd is None:
                 continue
             if config.as_of_jd is not None and obs_jd > config.as_of_jd:
@@ -158,11 +158,11 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
             eligible.append(hit)
 
         for h in eligible:
-            plate_exposures.setdefault(h.plate_id, []).append((h.obs_date_jd, h.solnum, h.exposure_num))
+            plate_exposures.setdefault(h.plate_id, []).append((h.exp_date_jd, h.solnum, h.exposure_num))
 
         best = max(
             eligible,
-            key=lambda h: h.obs_date_jd if h.obs_date_jd is not None else -1.0,
+            key=lambda h: h.exp_date_jd if h.exp_date_jd is not None else -1.0,
             default=None,
         )
         if best is not None:
@@ -212,18 +212,18 @@ def discover_candidate_plates(config: BuildConfig) -> list[CandidatePlate]:
 
         candidates.append(CandidatePlate(
             plate_id=plate_id,
-            obs_date_jd=max(valid_jds),
+            exp_date_jd=max(valid_jds),
             n_wcs_solutions=n_wcs,
             n_exposures=n_exposures,
             preferred_solution_num=preferred_solution_num,
             selected_at_points=point_count,
         ))
 
-    candidates.sort(key=lambda c: c.obs_date_jd)
+    candidates.sort(key=lambda c: c.exp_date_jd)
 
     if config.max_plates is not None and len(candidates) > config.max_plates:
-        candidates = sorted(candidates, key=lambda c: -c.obs_date_jd)[: config.max_plates]
-        candidates.sort(key=lambda c: c.obs_date_jd)
+        candidates = sorted(candidates, key=lambda c: -c.exp_date_jd)[: config.max_plates]
+        candidates.sort(key=lambda c: c.exp_date_jd)
 
     LOG.info("Final plate count: %d", len(candidates))
     return candidates

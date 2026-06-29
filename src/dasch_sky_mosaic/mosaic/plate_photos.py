@@ -14,7 +14,6 @@ from typing import Any
 from dasch_sky_mosaic.call_sg import (
     _should_log_progress,
     download_photo_via_sg,
-    jd_to_iso,
 )
 from dasch_sky_mosaic.mosaic.discover import (
     BuildConfig,
@@ -100,8 +99,7 @@ def discover_and_download_plate_photos(config: PlatePhotoConfig) -> dict[str, An
             status = "cached" if already_cached else "downloaded"
             records.append({
                 "plate_id": plate.plate_id,
-                "obs_date": jd_to_iso(plate.obs_date_jd),
-                "obs_date_jd": plate.obs_date_jd,
+                "expdate_jd": plate.exp_date_jd,
                 "status": status,
                 "local_photo_path": str(local_path),
                 "bytes": local_path.stat().st_size,
@@ -110,8 +108,7 @@ def discover_and_download_plate_photos(config: PlatePhotoConfig) -> dict[str, An
             LOG.warning("Photo download failed for %s: %s", plate.plate_id, exc)
             records.append({
                 "plate_id": plate.plate_id,
-                "obs_date": jd_to_iso(plate.obs_date_jd),
-                "obs_date_jd": plate.obs_date_jd,
+                "expdate_jd": plate.exp_date_jd,
                 "status": "download_failed",
                 "error": str(exc),
             })
@@ -124,8 +121,8 @@ def discover_and_download_plate_photos(config: PlatePhotoConfig) -> dict[str, An
             "width_deg": config.region.width_deg,
             "height_deg": config.region.height_deg,
         },
-        "as_of_date": jd_to_iso(config.as_of_jd) if config.as_of_jd else None,
-        "earliest_date": jd_to_iso(config.earliest_jd) if config.earliest_jd else None,
+        "as_of_jd": config.as_of_jd,
+        "earliest_jd": config.earliest_jd,
         "query_step_deg": config.query_step_deg,
         "n_candidates": len(candidates),
         "n_downloaded": sum(1 for r in records if r.get("status") in {"downloaded", "cached"}),

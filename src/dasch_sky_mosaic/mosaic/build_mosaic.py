@@ -15,7 +15,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from dasch_sky_mosaic.call_sg import parse_cli_date_jd
+from astropy.time import Time
+
 from dasch_sky_mosaic.mosaic.discover import BuildConfig, Region
 from dasch_sky_mosaic.mosaic.stitch import build_mosaic
 
@@ -85,8 +86,8 @@ def main(argv: list[str] | None = None) -> None:
 
     config = BuildConfig(
         region=Region(ra_deg=args.ra, dec_deg=args.dec, width_deg=args.width, height_deg=height),
-        as_of_jd=parse_cli_date_jd(args.as_of_date),
-        earliest_jd=parse_cli_date_jd(args.earliest_date),
+        as_of_jd=Time(args.as_of_date).jd if args.as_of_date else None,
+        earliest_jd=Time(args.earliest_date).jd if args.earliest_date else None,
         session_root=session_root,
         output_fits=output,
         epoch_fits=Path(args.epoch_fits) if args.epoch_fits else None,

@@ -9,9 +9,8 @@ dist/
 # Local data artifacts
 data/
 
-# Jupyter notebooks and checkpoints
-notebooks/
-.ipynb_checkpoints/
+# dev code and files
+dev/
 
 # Credentials and API keys
 credentials/

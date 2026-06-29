@@ -25,7 +25,6 @@ from reproject import reproject_interp
 from dasch_sky_mosaic.call_sg import (
     _should_log_progress,
     download_fits_batch_via_sg,
-    jd_to_iso,
 )
 from dasch_sky_mosaic.mosaic.background import (
     _estimate_overlap_template_refinement,
@@ -129,7 +128,7 @@ def _candidates_from_manifest(manifest_path: Path) -> tuple[list[CandidatePlate]
             continue
         candidates.append(CandidatePlate(
             plate_id=plate_id,
-            obs_date_jd=p["obs_date_jd"],
+            exp_date_jd=p["exp_date_jd"],
             n_wcs_solutions=p.get("n_wcs_solutions", 1),
             n_exposures=p.get("n_exposures", 1),
             preferred_solution_num=p.get("preferred_solution_num"),
@@ -188,7 +187,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
                 idx, len(candidates), 100.0 * idx / max(1, len(candidates)),
             )
         mosaic_path = mosaic_paths[candidate.plate_id]
-        LOG.info("Reprojecting %s  obs %s", mosaic_path.name, jd_to_iso(candidate.obs_date_jd))
+        LOG.info("Reprojecting %s  obs_jd=%.2f", mosaic_path.name, candidate.exp_date_jd or 0)
         plate_header, image = _read_first_image_hdu(mosaic_path)
 
         interior_native = _plate_interior_mask(image, binning=config.binning).astype(np.float32)
@@ -223,7 +222,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         all_reprojected.append(reprojected)
         all_good.append(good)
         all_templates.append(template_proj)
-        all_obs_jds.append(candidate.obs_date_jd)
+        all_obs_jds.append(candidate.exp_date_jd)
         all_names.append(mosaic_path.name)
 
     if apply_bg:
@@ -275,8 +274,8 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
 
     header = output_wcs.to_header(relax=True)
     header["BUNIT"] = "relative"
-    header["DASHASOF"] = (jd_to_iso(config.as_of_jd) if config.as_of_jd else "open", "Most-recent as-of date")
-    header["DASCHEA"] = (jd_to_iso(config.earliest_jd) if config.earliest_jd else "open", "Earliest allowed obs date")
+    header["DASHASOF"] = (config.as_of_jd if config.as_of_jd else 0.0, "Most-recent as-of date (JD)")
+    header["DASCHEA"] = (config.earliest_jd if config.earliest_jd else 0.0, "Earliest allowed obs date (JD)")
     header["DASCHNPL"] = (len(candidates), "Number of plates used")
     header["DASCHBIN"] = (config.binning, "DASCH mosaic binning level")
     header["DASCHPSC"] = (pixel_scale_arcsec, "Output pixel scale arcsec/pixel")
@@ -303,8 +302,8 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
 
     manifest: dict[str, Any] = {
         "region": asdict(config.region),
-        "as_of_date": jd_to_iso(config.as_of_jd) if config.as_of_jd else None,
-        "earliest_date": jd_to_iso(config.earliest_jd) if config.earliest_jd else None,
+        "as_of_jd": config.as_of_jd,
+        "earliest_jd": config.earliest_jd,
         "projection": config.projection,
         "pixel_scale_arcsec": pixel_scale_arcsec,
         "binning": config.binning,
@@ -316,8 +315,7 @@ def build_mosaic(config: BuildConfig) -> dict[str, Any]:
         "plates": [
             {
                 "plate_id": c.plate_id,
-                "obs_date": jd_to_iso(c.obs_date_jd),
-                "obs_date_jd": c.obs_date_jd,
+                "expdate_jd": c.exp_date_jd,
                 "n_wcs_solutions": c.n_wcs_solutions,
                 "n_exposures": c.n_exposures,
                 "preferred_solution_num": c.preferred_solution_num,

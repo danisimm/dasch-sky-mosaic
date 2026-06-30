@@ -254,7 +254,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download DASCH plate files via Starglass API")
     parser.add_argument("plate_id", help="Plate ID (e.g. ab12345)")
     parser.add_argument("download", choices=["photo", "fits", "both"], help="What to download")
-    parser.add_argument("--dest", default="output", help="Destination directory (default: output)")
+    parser.add_argument("--dest", default="data/cache", help="Destination directory (default: data/cache)")
     args = parser.parse_args()
 
     dest_dir = Path(args.dest)

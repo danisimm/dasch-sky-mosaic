@@ -101,7 +101,7 @@ def write_wtml(
     Each record in `plates` must have:
       - plate_id: str
       - image_url: str
-      - placement: dict (from derive_skyimage_placement)
+      - wcs_header: dict
       - image_width_px: int
       - image_height_px: int
     """
@@ -115,10 +115,13 @@ def write_wtml(
         },
     )
     for p in plates:
+        placement = derive_skyimage_placement(
+            p["wcs_header"], int(p["image_width_px"]), int(p["image_height_px"])
+        )
         root.append(make_place_element(
             plate_id=str(p["plate_id"]),
             image_url=str(p["image_url"]),
-            placement=p["placement"],
+            placement=placement,
             image_width_px=int(p["image_width_px"]),
             image_height_px=int(p["image_height_px"]),
         ))

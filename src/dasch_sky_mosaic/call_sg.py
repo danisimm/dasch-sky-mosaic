@@ -164,14 +164,12 @@ class StarglassClient:
 def download_fits_via_sg(
     plate_id: str,
     dest_dir: Path,
-    binning: int,
-    api_base: str,
-    api_key: str | None,
 ) -> Path:
-    """Download a single FITS mosaic via the Starglass mosaic_package endpoint."""
+    """Download a binning=16 FITS mosaic via the Starglass mosaic_package endpoint."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    client = StarglassClient(api_base=api_base, api_key=api_key)
-    package = client.get_mosaic_package(plate_id=plate_id, binning=binning)
+    api_key = _load_api_key()
+    client = StarglassClient(api_base="auto", api_key=api_key)
+    package = client.get_mosaic_package(plate_id=plate_id, binning=16)
     base_url = str(package.get("baseFitsUrl") or "").strip()
     if not base_url:
         raise RuntimeError(f"no FITS URL in mosaic_package response for {plate_id}")
@@ -180,7 +178,7 @@ def download_fits_via_sg(
     if remote_name:
         local_name = remote_name if remote_name.lower().startswith(plate_id.lower()) else f"{plate_id}_{remote_name}"
     else:
-        local_name = f"{plate_id}_bin{binning}.fits"
+        local_name = f"{plate_id}_bin16.fits"
 
     local_path = dest_dir / local_name
     if local_path.suffix.lower() == ".fz":
@@ -197,27 +195,6 @@ def download_fits_via_sg(
 
     return _decompress_fz(local_path)
 
-def download_fits_batch_via_sg(
-    plate_ids: list[str],
-    dest_dir: Path,
-    binning: int,
-    api_base: str,
-    api_key: str | None,
-) -> dict[str, Path]:
-    """Download FITS mosaics for a list of plate IDs. Returns {plate_id: local_path}."""
-    paths: dict[str, Path] = {}
-    for idx, plate_id in enumerate(plate_ids, start=1):
-        if _should_log_progress(idx, len(plate_ids)):
-            LOG.info(
-                "FITS download progress: %d/%d (%.0f%%)",
-                idx, len(plate_ids), 100.0 * idx / max(1, len(plate_ids)),
-            )
-        try:
-            paths[plate_id] = download_fits_via_sg(plate_id, dest_dir, binning, api_base, api_key)
-        except Exception as exc:
-            LOG.warning("FITS download failed for %s: %s", plate_id, exc)
-    return paths
-
 # ---------------------------------------------------------------------------
 # Photo (JPG) download via Starglass plates API
 # ---------------------------------------------------------------------------
@@ -225,19 +202,17 @@ def download_fits_batch_via_sg(
 def download_photo_via_sg(
     plate_id: str,
     dest_dir: Path,
-    api_base: str,
-    api_key: str | None,
-    overwrite: bool = False,
 ) -> Path:
     """Download a plate JPG via the Starglass plates API."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{plate_id}_pphoto_all.jpg"
 
-    if dest.exists() and not overwrite:
+    if dest.exists():
         LOG.info("Reusing cached photo for %s", plate_id)
         return dest
 
-    client = StarglassClient(api_base=api_base, api_key=api_key)
+    api_key = _load_api_key()
+    client = StarglassClient(api_base="auto", api_key=api_key)
     payload = client.get_plate(plate_id)
     images = payload.get("plate_images", [])
     if not images or not images[0].get("url"):
@@ -258,10 +233,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dest_dir = Path(args.dest)
-    api_key = _load_api_key()
     if args.download in ("photo", "both"):
-        path = download_photo_via_sg(args.plate_id, dest_dir, api_base="auto", api_key=api_key)
+        path = download_photo_via_sg(args.plate_id, dest_dir)
         print(f"Photo saved to: {path}")
     if args.download in ("fits", "both"):
-        path = download_fits_via_sg(args.plate_id, dest_dir, binning=16, api_base="auto", api_key=api_key)
+        path = download_fits_via_sg(args.plate_id, dest_dir)
         print(f"FITS saved to: {path}")

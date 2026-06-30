@@ -1,26 +1,14 @@
-"""Solve WCS for plate JPGs and produce placement data for WTML generation.
+"""Solve WCS for plate JPGs using astroalign.
 
-Two solver backends are available (selected via --solver):
-  astroalign  - Aligns the JPG to the FITS mosaic WCS using star pattern matching.
-                Requires both a JPG and a FITS download per plate (~2 files).
-  scamp       - [STUB] Source extraction + SCAMP astrometric solve.
-                Requires only a JPG (~1 file). Not yet implemented.
+Given a plate photo (JPG) and a FITS mosaic, aligns the photo to the FITS
+WCS via star pattern matching and returns a WCS header for the photo.
 
-For each plate the output is a JSON record containing the WCS header and the
-WWT SkyImage placement fields needed to build a WTML link.
-
-Run directly:
-    python -m dasch_sky_mosaic.wcs_solve <plate_id> [plate_id ...] [options]
-
-Or import solve_plate_wcs() for library use.
+Import solve_plate_wcs() for library use. Downloads and WTML generation
+are handled by pipeline.py.
 """
 from __future__ import annotations
 
-import argparse
-import json
 import logging
-import os
-import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -28,11 +16,6 @@ from typing import Any
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import FITSFixedWarning, WCS
-from astropy.wcs.utils import proj_plane_pixel_scales
-
-from dasch_sky_mosaic.call_s3 import download_photo_from_s3
-from dasch_sky_mosaic.call_sg import download_fits_via_sg, download_photo_via_sg
-from dasch_sky_mosaic.wtml_gen import derive_skyimage_placement
 
 LOG = logging.getLogger(__name__)
 
@@ -64,7 +47,6 @@ def _load_plate_fits(fits_path: Path) -> tuple[dict[str, Any], WCS, tuple[int, i
 # ---------------------------------------------------------------------------
 
 def _normalize_image(img: Any) -> Any:
-    import numpy as np
     p1, p99 = np.percentile(img, (1.0, 99.0))
     if p99 <= p1:
         return img.astype(np.float32) * 0
@@ -75,56 +57,41 @@ def _normalize_image(img: Any) -> Any:
 def _astroalign_find_transform(
     alignment_source: Any,
     fits_data: Any,
-) -> tuple[Any | None, int, str]:
+) -> tuple[Any | None, int]:
     """Find a similarity transform mapping plate-photo pixels to FITS pixels.
 
-    Returns (transform, n_matches, mode_label).
+    Returns (transform, n_matches). Photos have dark stars so the source is
+    inverted before detection.
     """
     try:
         import astroalign as aa
     except ImportError:
         LOG.warning("astroalign not installed; cannot solve WCS via this backend.")
-        return None, 0, "unavailable"
+        return None, 0
 
     try:
-        src_rgb = np.array(alignment_source, dtype=np.float32)
-        src_gray = _normalize_image(src_rgb[:, :, 0])
+        # Photos have dark stars; invert so peaks are detectable by astroalign
+        src_gray = 1.0 - _normalize_image(np.array(alignment_source, dtype=np.float32))
         fits_norm = _normalize_image(np.array(fits_data, dtype=np.float32))
 
-        best_transform: Any = None
-        best_label = ""
-        best_matches = 0
-
-        for label, source in (("native", src_gray), ("inverted", 1.0 - src_gray)):
-            try:
-                transform, (src_pts, _) = aa.find_transform(
-                    source,
-                    fits_norm,
-                    max_control_points=150,
-                    detection_sigma=4,
-                    min_area=3,
-                )
-            except Exception:
-                continue
-            n = int(len(src_pts))
-            if n > best_matches:
-                best_matches = n
-                best_transform = transform
-                best_label = label
-
-        if best_transform is None or best_matches < 6:
-            return None, 0, "none"
-
-        LOG.info(
-            "Astroalign: mode=%s matches=%d scale=%.5f rot_deg=%.3f",
-            best_label, best_matches,
-            float(best_transform.scale),
-            float(np.degrees(best_transform.rotation)),
+        transform, (src_pts, _) = aa.find_transform(
+            src_gray,
+            fits_norm,
+            max_control_points=150,
+            detection_sigma=4,
+            min_area=3,
         )
-        return best_transform, best_matches, best_label
+        n = int(len(src_pts))
+        LOG.info(
+            "Astroalign: matches=%d scale=%.5f rot_deg=%.3f",
+            n,
+            float(transform.scale),
+            float(np.degrees(transform.rotation)),
+        )
+        return transform, n
     except Exception:
         LOG.exception("Astroalign failed.")
-        return None, 0, "error"
+        return None, 0
 
 
 def _compose_wcs_from_affine(
@@ -168,11 +135,10 @@ def _compose_wcs_from_affine(
 def _solve_wcs_astroalign(
     photo_path: Path,
     fits_path: Path,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], int, int]:
     """Align photo JPG to FITS WCS using astroalign.
 
-    Returns (wcs_header, alignment_meta).
-    wcs_header is a dict of FITS-compatible WCS keywords for the JPG.
+    Returns (wcs_header, alignment_meta, image_width, image_height).
     """
     from PIL import Image
 
@@ -180,7 +146,7 @@ def _solve_wcs_astroalign(
     target_h, target_w = shape
 
     with Image.open(photo_path) as opened:
-        src = opened.convert("RGB")
+        src = opened.convert("L")
     src_w, src_h = src.size
 
     def _cover_resize(candidate: Any) -> tuple[Any, float]:
@@ -206,7 +172,7 @@ def _solve_wcs_astroalign(
         y0 = max(0, min((resized.height - target_h) // 2, resized.height - target_h))
         match_img = resized.crop((x0, y0, x0 + target_w, y0 + target_h))
 
-        transform, n_matches, mode_label = _astroalign_find_transform(match_img, fits_data)
+        transform, n_matches = _astroalign_find_transform(match_img, fits_data)
         if transform is None:
             continue
 
@@ -231,44 +197,16 @@ def _solve_wcs_astroalign(
             best_meta = {
                 "backend": "astroalign",
                 "parity": label,
-                "mode": mode_label,
                 "matches": n_matches,
                 "transform_scale": float(transform.scale),
                 "transform_rotation_deg": float(np.degrees(transform.rotation)),
             }
 
-    if best_header is not None and best_meta is not None:
-        LOG.info("Astroalign parity pick: %s (matches=%d)", best_meta["parity"], best_matches)
-        return best_header, best_meta
+    if best_header is None:
+        raise RuntimeError(f"Astroalign found no match for {photo_path.name}")
 
-    # Fallback: simple centered scaling, no rotation.
-    LOG.warning("Astroalign found no match for %s; using fallback centered scaling.", photo_path.name)
-    resized, resize_scale = _cover_resize(src)
-    x0 = max(0, min((resized.width - target_w) // 2, resized.width - target_w))
-    y0 = max(0, min((resized.height - target_h) // 2, resized.height - target_h))
-    fallback_a = np.eye(2, dtype=np.float64) * resize_scale
-    fallback_t = np.array([-x0, -y0], dtype=np.float64)
-    fallback_header = _compose_wcs_from_affine(reference_wcs, fallback_a, fallback_t)
-    fallback_meta = {
-        "backend": "astroalign",
-        "parity": "source",
-        "mode": "fallback_centered",
-        "matches": 0,
-    }
-    return fallback_header, fallback_meta
-
-
-def _solve_wcs_scamp(
-    photo_path: Path,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """[STUB] Solve WCS using SExtractor + SCAMP.
-
-    This backend requires only the JPG (no FITS download) and may be faster
-    at scale. Implement once the SCAMP output format is confirmed.
-    """
-    raise NotImplementedError(
-        "SCAMP backend not yet implemented. Use --solver astroalign for now."
-    )
+    LOG.info("Astroalign parity pick: %s (matches=%d)", best_meta["parity"], best_matches)
+    return best_header, best_meta, src_w, src_h
 
 
 # ---------------------------------------------------------------------------
@@ -278,146 +216,21 @@ def _solve_wcs_scamp(
 def solve_plate_wcs(
     plate_id: str,
     photo_path: Path,
-    fits_path: Path | None,
-    solver: str = "astroalign",
+    fits_path: Path,
 ) -> dict[str, Any]:
-    """Solve WCS for a plate JPG and return placement data.
+    """Solve WCS for a plate JPG and return WCS data.
 
     Returns a dict with:
       - plate_id
       - wcs_header: dict of FITS WCS keywords for the JPG
-      - placement: WWT SkyImage fields (from derive_skyimage_placement)
       - image_width_px, image_height_px
-      - alignment_meta: solver-specific diagnostics
+      - alignment_meta: solver diagnostics
     """
-    from PIL import Image
-
-    with Image.open(photo_path) as img:
-        image_w, image_h = img.size
-
-    if solver == "astroalign":
-        if fits_path is None:
-            raise ValueError("astroalign solver requires a FITS file path")
-        wcs_header, alignment_meta = _solve_wcs_astroalign(photo_path, fits_path)
-    elif solver == "scamp":
-        wcs_header, alignment_meta = _solve_wcs_scamp(photo_path)
-    else:
-        raise ValueError(f"Unknown solver: {solver!r}. Choose 'astroalign' or 'scamp'.")
-
-    placement = derive_skyimage_placement(wcs_header, image_w, image_h)
-
+    wcs_header, alignment_meta, image_w, image_h = _solve_wcs_astroalign(photo_path, fits_path)
     return {
         "plate_id": plate_id,
         "wcs_header": wcs_header,
-        "placement": placement,
         "image_width_px": image_w,
         "image_height_px": image_h,
         "alignment_meta": alignment_meta,
     }
-
-
-# ---------------------------------------------------------------------------
-# Batch runner
-# ---------------------------------------------------------------------------
-
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Solve WCS for one or more DASCH plate JPGs.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("plate_ids", nargs="+", help="Plate IDs to process (e.g. a11740 br00130)")
-    p.add_argument(
-        "--solver",
-        choices=["astroalign", "scamp"],
-        default="astroalign",
-        help="WCS solver backend to use",
-    )
-    p.add_argument(
-        "--download-method",
-        choices=["s3", "sg"],
-        default="s3",
-        help="How to download plate JPGs: s3 (direct, cheaper) or sg (Starglass API)",
-    )
-    p.add_argument("--photo-dir", default="data/cache/photos", help="Directory to cache downloaded JPGs")
-    p.add_argument("--fits-dir", default="data/cache/mosaic_package", help="Directory to cache downloaded FITS")
-    p.add_argument("--output-dir", default="data/output/wcs", help="Directory for output JSON files")
-    p.add_argument("--binning", type=int, choices=[1, 16], default=16, help="FITS mosaic binning level")
-    p.add_argument("--api-base", default="auto", help="Starglass API base URL (for --download-method sg)")
-    p.add_argument("--api-key", default=None, help="Starglass API key (or set STARGLASS_API_KEY env var)")
-    p.add_argument("--overwrite", action="store_true", help="Re-download and re-solve even if cached")
-    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    return p.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> None:
-    from dotenv import load_dotenv
-    load_dotenv()
-
-    args = _parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
-
-    api_key = args.api_key or os.environ.get("STARGLASS_API_KEY")
-    photo_dir = Path(args.photo_dir)
-    fits_dir = Path(args.fits_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    results: list[dict[str, Any]] = []
-
-    for plate_id in args.plate_ids:
-        plate_id = plate_id.strip().lower()
-        LOG.info("Processing plate %s", plate_id)
-        out_path = output_dir / f"{plate_id}_wcs.json"
-
-        if out_path.exists() and not args.overwrite:
-            LOG.info("Skipping %s (cached at %s)", plate_id, out_path)
-            results.append(json.loads(out_path.read_text()))
-            continue
-
-        try:
-            # Download JPG
-            if args.download_method == "s3":
-                photo_path = download_photo_from_s3(plate_id, photo_dir, overwrite=args.overwrite)
-            else:
-                photo_path = download_photo_via_sg(
-                    plate_id, photo_dir,
-                    api_base=args.api_base, api_key=api_key,
-                    overwrite=args.overwrite,
-                )
-
-            # Download FITS if needed
-            fits_path: Path | None = None
-            if args.solver == "astroalign":
-                fits_path = download_fits_via_sg(
-                    plate_id, fits_dir,
-                    binning=args.binning,
-                    api_base=args.api_base,
-                    api_key=api_key,
-                )
-
-            result = solve_plate_wcs(
-                plate_id=plate_id,
-                photo_path=photo_path,
-                fits_path=fits_path,
-                solver=args.solver,
-            )
-            out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-            results.append(result)
-            LOG.info("Saved WCS for %s → %s", plate_id, out_path)
-
-        except Exception as exc:
-            LOG.error("Failed for %s: %s", plate_id, exc)
-            results.append({"plate_id": plate_id, "error": str(exc)})
-
-    # Print a short summary
-    n_ok = sum(1 for r in results if "error" not in r)
-    n_fail = len(results) - n_ok
-    print(f"Done: {n_ok}/{len(results)} plates solved, {n_fail} failed.")
-
-
-if __name__ == "__main__":
-    main()

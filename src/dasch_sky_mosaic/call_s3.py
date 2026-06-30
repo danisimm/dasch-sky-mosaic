@@ -51,16 +51,12 @@ def _s3_download(key: str, dest: Path) -> None:
             f.write(chunk)
 
 
-def download_photo_from_s3(
-    plate_id: str,
-    dest_dir: Path,
-    overwrite: bool = False,
-) -> Path:
+def download_photo_from_s3(plate_id: str, dest_dir: Path) -> Path:
     """Download a plate JPG directly from S3."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{plate_id}_pphoto_all.jpg"
 
-    if dest.exists() and not overwrite:
+    if dest.exists():
         LOG.info("Reusing cached photo for %s", plate_id)
         return dest
 
@@ -69,11 +65,7 @@ def download_photo_from_s3(
     return dest
 
 
-def download_fits_from_s3(
-    plate_id: str,
-    dest_dir: Path,
-    overwrite: bool = False,
-) -> Path:
+def download_fits_from_s3(plate_id: str, dest_dir: Path) -> Path:
     """Download a binning=16 FITS mosaic directly from S3 and decompress to .fits.
 
     Lists objects under the plate prefix and matches with a regex to find the
@@ -94,7 +86,7 @@ def download_fits_from_s3(
     dest_fz = dest_dir / filename
     dest_fits = _unpacked_path(dest_fz)
 
-    if dest_fits.exists() and not overwrite:
+    if dest_fits.exists():
         LOG.info("Reusing cached FITS for %s: %s", plate_id, dest_fits.name)
         return dest_fits
 

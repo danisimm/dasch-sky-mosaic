@@ -24,10 +24,20 @@ try:
 except ImportError:
     from astropy.utils.exceptions import ErfaWarning
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 LOG = logging.getLogger(__name__)
 
 PUBLIC_API_BASE = "https://api.starglass.cfa.harvard.edu/public"
 FULL_API_BASE = "https://api.starglass.cfa.harvard.edu/full"
+
+_CREDS_FILE = Path(__file__).parents[2] / "credentials" / "starglass_api_key.txt"
+
+
+def _load_api_key() -> str | None:
+    try:
+        return _CREDS_FILE.read_text(encoding="utf-8").strip() or None
+    except FileNotFoundError:
+        return None
 MAX_QUERY_DEC_DEG = 85.0
 
 # ---------------------------------------------------------------------------
@@ -236,3 +246,22 @@ def download_photo_via_sg(
     LOG.info("Downloading photo for %s via Starglass", plate_id)
     _download_stream(str(images[0]["url"]), dest)
     return dest
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Download DASCH plate files via Starglass API")
+    parser.add_argument("plate_id", help="Plate ID (e.g. ab12345)")
+    parser.add_argument("download", choices=["photo", "fits", "both"], help="What to download")
+    parser.add_argument("--dest", default="output", help="Destination directory (default: output)")
+    args = parser.parse_args()
+
+    dest_dir = Path(args.dest)
+    api_key = _load_api_key()
+    if args.download in ("photo", "both"):
+        path = download_photo_via_sg(args.plate_id, dest_dir, api_base="auto", api_key=api_key)
+        print(f"Photo saved to: {path}")
+    if args.download in ("fits", "both"):
+        path = download_fits_via_sg(args.plate_id, dest_dir, binning=16, api_base="auto", api_key=api_key)
+        print(f"FITS saved to: {path}")

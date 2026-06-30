@@ -18,6 +18,7 @@ import boto3
 
 from dasch_sky_mosaic.utils import _decompress_fz, _unpacked_path
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 LOG = logging.getLogger(__name__)
 
 S3_BUCKET = "dasch-prod-user"
@@ -100,3 +101,21 @@ def download_fits_from_s3(
     LOG.info("Downloading FITS for %s from S3: %s", plate_id, filename)
     _s3_download(key, dest_fz)
     return _decompress_fz(dest_fz)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Download DASCH plate files from S3")
+    parser.add_argument("plate_id", help="Plate ID (e.g. ab12345)")
+    parser.add_argument("download", choices=["photo", "fits", "both"], help="What to download")
+    parser.add_argument("--dest", default="output", help="Destination directory (default: output)")
+    args = parser.parse_args()
+
+    dest_dir = Path(args.dest)
+    if args.download in ("photo", "both"):
+        path = download_photo_from_s3(args.plate_id, dest_dir)
+        print(f"Photo saved to: {path}")
+    if args.download in ("fits", "both"):
+        path = download_fits_from_s3(args.plate_id, dest_dir)
+        print(f"FITS saved to: {path}")

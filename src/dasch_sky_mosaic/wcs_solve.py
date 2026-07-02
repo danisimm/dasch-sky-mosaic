@@ -3,22 +3,21 @@
 Given a plate photo (JPG) and a FITS mosaic, aligns the photo to the FITS
 WCS via star pattern matching and returns a WCS header for the photo.
 
-Import solve_plate_wcs() for library use. Downloads and WTML generation
-are handled by pipeline.py.
 """
 from __future__ import annotations
 
 import logging
-import threading
+import multiprocessing as mp
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import astroalign as aa
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import FITSFixedWarning, WCS
-from PIL import Image
+from PIL import Image, ImageOps
 
 LOG = logging.getLogger(__name__)
 
@@ -53,6 +52,21 @@ def _normalize_image(img: Any) -> Any:
 _ASTROALIGN_TIMEOUT_S = 5.0
 
 
+def _astroalign_worker(src_gray: Any, fits_norm: Any, result_queue: "mp.Queue") -> None:
+    """Run in a child process so a hung/slow match can actually be killed on timeout."""
+    try:
+        transform, (src_pts, _) = aa.find_transform(
+            src_gray,
+            fits_norm,
+            max_control_points=100,
+            detection_sigma=5,
+            min_area=5,
+        )
+        result_queue.put(("ok", transform.params, float(transform.scale), float(transform.rotation), len(src_pts)))
+    except Exception as exc:
+        result_queue.put(("error", str(exc)))
+
+
 def _astroalign_find_transform(
     plate_img: Any,
     fits_norm: Any,
@@ -62,48 +76,33 @@ def _astroalign_find_transform(
     Returns (transform, n_matches). Photos have dark stars so the source is
     inverted before detection. fits_norm should be pre-normalized.
 
-    Gives up after _ASTROALIGN_TIMEOUT_S seconds so a wrong-parity attempt
-    doesn't block for minutes exhausting all triangle combinations.
     """
     src_gray = 1.0 - _normalize_image(np.array(plate_img, dtype=np.float32))
 
-    _result: list[Any] = [None]
-    _exc: list[BaseException | None] = [None]
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue = ctx.Queue()
+    proc = ctx.Process(target=_astroalign_worker, args=(src_gray, fits_norm, result_queue))
+    proc.start()
+    proc.join(timeout=_ASTROALIGN_TIMEOUT_S)
 
-    def _run() -> None:
-        try:
-            transform, (src_pts, _) = aa.find_transform(
-                src_gray,
-                fits_norm,
-                max_control_points=100,
-                detection_sigma=5,
-                min_area=5,
-            )
-            _result[0] = (transform, src_pts)
-        except Exception as exc:
-            _exc[0] = exc
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    thread.join(timeout=_ASTROALIGN_TIMEOUT_S)
-
-    if thread.is_alive():
+    if proc.is_alive():
         LOG.info("Astroalign timed out after %.1fs", _ASTROALIGN_TIMEOUT_S)
+        proc.terminate()
+        proc.join()
         return None, 0
 
-    if _exc[0] is not None:
-        LOG.info("Astroalign failed: %s", _exc[0])
+    if result_queue.empty():
+        LOG.info("Astroalign failed: worker exited without a result (exit code %s)", proc.exitcode)
         return None, 0
 
-    transform, src_pts = _result[0]
-    n = int(len(src_pts))
-    LOG.info(
-        "Astroalign: matches=%d scale=%.5f rot_deg=%.3f",
-        n,
-        float(transform.scale),
-        float(np.degrees(transform.rotation)),
-    )
-    return transform, n
+    status, *payload = result_queue.get()
+    if status == "error":
+        LOG.info("Astroalign failed: %s", payload[0])
+        return None, 0
+
+    params, scale, rotation, n = payload
+    LOG.info("Astroalign: matches=%d scale=%.5f rot_deg=%.3f", n, scale, np.degrees(rotation))
+    return SimpleNamespace(params=params, scale=scale, rotation=rotation), n
 
 
 def _cover_resize(
@@ -178,7 +177,10 @@ def solve_plate_wcs(
     fits_norm = _normalize_image(np.array(fits_data, dtype=np.float32))
 
     with Image.open(photo_path) as opened:
-        src = opened.convert("L")
+        # Browsers/WWT auto-rotate a displayed image per its EXIF orientation
+        # tag; PIL doesn't. Normalize here so we solve against the same pixel
+        # orientation that will actually be rendered.
+        src = ImageOps.exif_transpose(opened).convert("L")
     src_w, src_h = src.size
 
     resized, resize_scale = _cover_resize(src, target_w, target_h)

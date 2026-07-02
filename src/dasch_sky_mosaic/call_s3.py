@@ -1,11 +1,7 @@
 """Direct S3 download helpers for plate photos and FITS mosaics.
 
 DASCH files live in the `dasch-prod-user` bucket. This module provides
-functions to download them directly from S3, bypassing the Starglass API.
-Advantages over call_sg: no Starglass rate limiting, and no reliance on
-presigned URLs (which expire ~15 minutes after the API call).
-
-Always uses binning=16 (the binning=1 files are too large).
+functions to download them directly from S3.
 """
 from __future__ import annotations
 

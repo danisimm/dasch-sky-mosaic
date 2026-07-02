@@ -4,7 +4,7 @@ Run directly:
     python -m dasch_sky_mosaic.pipeline <plate_id> [plate_id ...]
 
 Edit the configuration block at the bottom of this file before running.
-WCS results are saved as JSON to WCS_CACHE_DIR. WTML generation is handled
+WCS results are saved as JSON to WCS_CACHE_DIR. WWT webclient link generation is handled
 separately (e.g. by a Lambda function reading those JSON files from S3).
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ def run_pipeline(
         plate_ids: Plate IDs to process.
         photo_dir: Directory to cache downloaded JPGs.
         fits_dir: Directory to cache downloaded FITS.
-        download_method: 's3' (direct, no rate limits) or 'sg' (Starglass API).
+        download_method: 's3' (AWS) or 'sg' (Starglass API).
         wcs_cache_dir: If set, saves a WCS JSON file per plate here.
     """
     records: list[dict[str, Any]] = []

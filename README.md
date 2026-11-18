@@ -30,42 +30,29 @@ Credentials and API key files live in `credentials/` (gitignored).
 
 ## Workflow 1: WCS batch solve
 
-Given a list of plate IDs, download the plate JPG (and FITS for the astroalign solver),
-solve WCS for each JPG, and write per-plate JSON containing placement data for WTML
-generation. Intended to run at scale across 400k+ plates.
+Given a list of plate IDs, download the plate JPG and its binning-16 FITS mosaic,
+solve WCS for the JPG by aligning it to the FITS (astroalign star-pattern matching),
+and write per-plate JSON for WTML generation. Intended to run at scale across 400k+ plates.
 
 ```powershell
-python -m dasch_sky_mosaic.wcs_solve a11740 br00130 `
-    --download-method s3 `
-    --solver astroalign `
-    --output-dir data/output/wcs
+python -m dasch_sky_mosaic.pipeline a11740 br00130
 ```
 
-### Key options
-
-- `--solver {astroalign,scamp}`: WCS solver backend.
-  - `astroalign` (default): aligns the JPG to the FITS mosaic via star pattern matching.
-    Requires downloading both a JPG and a FITS per plate.
-  - `scamp`: SExtractor + SCAMP solve from the JPG only. **Not yet implemented (stub).**
-- `--download-method {s3,sg}`: how to fetch plate JPGs.
-  - `s3` (default): direct S3 download, faster and cheaper.
-  - `sg`: Starglass API.
-- `--photo-dir`: cache directory for downloaded JPGs (default: `data/cache/photos`).
-- `--fits-dir`: cache directory for downloaded FITS (default: `data/cache/mosaic_package`).
-- `--output-dir`: directory for output JSON files (default: `data/output/wcs`).
-- `--binning {1,16}`: DASCH mosaic binning level (default: `16`).
-- `--overwrite`: re-download and re-solve even if cached.
-- `--api-key`: Starglass API key (or set `STARGLASS_API_KEY` env var).
+Settings (download method `s3`/`sg`, cache and output directories) are set in the
+configuration block at the bottom of `pipeline.py`.
 
 ### Output
 
-Each plate produces a JSON file `{plate_id}_wcs.json` containing:
+Each plate produces `data/output/wcs/{plate_id}_wcs.json` containing:
 - `wcs_header`: FITS WCS keywords for the plate JPG
-- `placement`: WWT SkyImage fields (`center_x/y`, `rotation_deg`, `base_degrees_per_tile`, etc.)
 - `image_width_px`, `image_height_px`
-- `alignment_meta`: solver diagnostics (backend, matches, parity, etc.)
+- `alignment_meta`: solver diagnostics (backend, parity, matches, transform scale/rotation)
 
-WTML generation from this data is handled server-side by an AWS Lambda function.
+`wtml_gen.py` converts these records into WWT placement fields and WTML. In production,
+WTML generation is meant to happen server-side in an AWS Lambda function.
+
+A JPG-only SExtractor + SCAMP solver was tried and shelved; see the
+`archive/scamp-single-image` branch (`SCAMP_ARCHIVE.md`).
 
 ---
 
@@ -114,8 +101,9 @@ python -m dasch_sky_mosaic.mosaic.build_mosaic `
 ```
 src/dasch_sky_mosaic/
   call_sg.py         # Starglass API client; JPG and FITS download via API
-  call_s3.py         # Direct S3 downloads (JPG working; FITS stub pending key structure)
-  wcs_solve.py       # Astroalign WCS solver; runnable batch script
+  call_s3.py         # Direct S3 downloads (JPG and binning-16 FITS)
+  pipeline.py        # Runnable batch script: download + solve + save JSON
+  wcs_solve.py       # Astroalign WCS solver (JPG aligned to FITS mosaic)
   wtml_gen.py        # Pure WTML XML generation from WCS placement dicts
   mosaic/
     discover.py      # Region/BuildConfig dataclasses; plate grid discovery via queryexps

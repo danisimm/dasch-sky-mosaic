@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "astropy>=6.1",
   "astroalign>=2.5",
+  "astroquery>=0.4.7",
   "boto3>=1.26",
   "numpy>=2.0",
   "pillow>=10.0",

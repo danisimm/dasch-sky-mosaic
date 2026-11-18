@@ -105,6 +105,7 @@ src/dasch_sky_mosaic/
   pipeline.py        # Runnable batch script: download + solve + save JSON
   wcs_solve.py       # Astroalign WCS solver (JPG aligned to FITS mosaic)
   wtml_gen.py        # Pure WTML XML generation from WCS placement dicts
+  wwt_webclient_link.py  # WWT webclient (ShowImage.aspx) links for single plates
   mosaic/
     discover.py      # Region/BuildConfig dataclasses; plate grid discovery via queryexps
     background.py    # Montage-style global background matching

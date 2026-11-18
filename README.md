@@ -51,8 +51,9 @@ Each plate produces `data/output/wcs/{plate_id}_wcs.json` containing:
 `wtml_gen.py` converts these records into WWT placement fields and WTML. In production,
 WTML generation is meant to happen server-side in an AWS Lambda function.
 
-A JPG-only SExtractor + SCAMP solver was tried and shelved; see the
-`archive/scamp-single-image` branch (`SCAMP_ARCHIVE.md`).
+A JPG-only SExtractor + SCAMP solver was tried and shelved; it is preserved under
+the git tag `scamp-archive` (see `SCAMP_ARCHIVE.md` there). To work on it again:
+`git switch -c scamp-revival scamp-archive`.
 
 ---
 

@@ -1,0 +1,10 @@
+# Same versions as the local .venv the solver was tested with.
+# boto3 is not listed: the AWS Lambda base image already includes it.
+astroalign==2.6.2
+astropy==8.0.0
+numpy==2.5.0
+pillow==12.2.0
+scikit-image==0.26.0
+scipy==1.18.0
+sep==1.4.1
+wwt-data-formats==0.18.1

@@ -1,0 +1,5 @@
+# Keep Linux line endings for files that run inside the Linux container.
+Dockerfile text eol=lf
+*.sh text eol=lf
+lambda/*.py text eol=lf
+lambda/requirements.txt text eol=lf
